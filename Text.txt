@@ -1,0 +1,644 @@
+For the system you're describing, I would implement it like this:
+
+# 1. Published Chapters Not Showing
+
+Current problem:
+
+```text
+Author
+  ↓
+Publish Chapter
+  ↓
+Chapter Saved
+  ↓
+Reader Cannot See It
+```
+
+The issue is usually that the reader page is not filtering correctly or the chapter status is not updating.
+
+Your chapter system should have:
+
+```text
+Chapter
+├── Draft
+├── Published
+├── CreatedDate
+├── PublishedDate
+└── Visibility
+```
+
+Reader pages should only fetch:
+
+```text
+Published = True
+```
+
+Library, Featured, Explore, and Book Detail pages should all pull from the same published chapter source.
+
+Flow:
+
+```text
+Save
+  ↓
+Draft
+
+Publish
+  ↓
+Published
+
+Published
+  ↓
+Visible Everywhere
+```
+
+---
+
+# 2. Flames System
+
+I agree with limiting Flames.
+
+WebNovel-style systems work because support is scarce.
+
+I would use:
+
+```text
+3 Flames Per Day
+```
+
+For every user.
+
+System:
+
+```text
+User
+├── Daily Flames Available = 3
+├── Last Reset Date
+└── Flames Given Today
+```
+
+Flow:
+
+```text
+User receives
+3 Flames
+
+Give 1
+Remaining = 2
+
+Give 1
+Remaining = 1
+
+Give 1
+Remaining = 0
+```
+
+Then:
+
+```text
+00:00 Server Time
+```
+
+or
+
+```text
+Local Midnight
+```
+
+resets:
+
+```text
+Remaining Flames = 3
+```
+
+---
+
+# 3. Flame Restrictions
+
+Prevent abuse.
+
+Rules:
+
+```text
+Cannot flame own book
+
+Cannot flame same book
+multiple times in one day
+
+Cannot exceed 3 flames daily
+```
+
+---
+
+# 4. Flame Rankings
+
+Every flame contributes to ranking.
+
+Example:
+
+```text
+1 Flame = 100 Points
+```
+
+Ranking Score:
+
+```text
+Views
++
+Favorites
++
+Followers
++
+Flames
+```
+
+Flames should have the highest weight.
+
+---
+
+# 5. Views System
+
+I would strongly advise against:
+
+```text
+5 Minutes
+=
+10 Views
+```
+
+because this can be abused.
+
+Someone could leave the chapter open for hours.
+
+---
+
+# Better View System
+
+Track:
+
+```text
+Unique Reader
++
+Minimum Reading Time
+```
+
+Example:
+
+```text
+User opens chapter
+
+Reads 5 minutes
+
+Award:
++1 View
+```
+
+Not:
+
+```text
++10 Views
+```
+
+---
+
+# Better Analytics
+
+Store:
+
+```text
+Views
+Readers
+Reading Time
+Completion Rate
+```
+
+Example:
+
+```text
+Chapter 10
+
+Views: 1,000
+
+Unique Readers: 600
+
+Average Reading Time: 8m
+
+Completion Rate: 78%
+```
+
+This gives authors useful information.
+
+---
+
+# Recommended View Formula
+
+```text
+Open Chapter
+       ↓
+Stay 5 Minutes
+       ↓
+Reach 50% Scroll
+       ↓
++1 View
+```
+
+This prevents fake views.
+
+---
+
+# If You Want Bigger Numbers
+
+Instead of:
+
+```text
+1 Reader
+=
+10 Views
+```
+
+use:
+
+```text
+1 Reader
+=
+1 View
+```
+
+and separately track:
+
+```text
+Engagement Score
+```
+
+Example:
+
+```text
+Read 5 Minutes
++10 Engagement
+
+Read Entire Chapter
++25 Engagement
+
+Comment
++15 Engagement
+
+Flame
++100 Engagement
+```
+
+Then rankings use:
+
+```text
+Views
+Favorites
+Followers
+Flames
+Engagement
+```
+
+which is much harder to manipulate and gives a more accurate ranking system.
+
+So my recommendation would be:
+
+* Fix publishing so published chapters instantly appear everywhere.
+* Give every user **3 Flames daily**, resetting at midnight.
+* Make Flames the strongest ranking factor.
+* Count **1 genuine read = 1 view**.
+* Use reading time and completion rate as separate engagement metrics rather than inflating view counts.
+
+
+Those are all features I would consider essential for Mynovel rather than optional enhancements.
+
+# Character Images
+
+Characters should support image uploads.
+
+Current:
+
+```text
+Character
+├── Name
+├── Description
+└── Information
+```
+
+Should become:
+
+```text
+Character
+├── Portrait Image
+├── Banner Image
+├── Name
+├── Title
+├── Description
+├── Biography
+├── Relationships
+├── Abilities
+└── Additional Information
+```
+
+Requirements:
+
+* Upload image
+* Replace image
+* Delete image
+* Image cropping
+* Automatic resizing
+* Character gallery (optional)
+
+The uploaded character image should automatically appear on:
+
+* Character tab
+* Character profile
+* Book information page
+
+---
+
+# Book Covers
+
+Books should support:
+
+```text
+Book
+├── Cover Image
+├── Banner Image
+├── Title
+├── Synopsis
+├── Tags
+└── Metadata
+```
+
+Requirements:
+
+### Cover
+
+Used in:
+
+* Featured
+* Library
+* Explore
+* Rankings
+
+### Banner
+
+Used in:
+
+* Book page header
+* Recommendations
+* Featured sections
+
+---
+
+# Chapter Comments
+
+Every chapter should have comments.
+
+Structure:
+
+```text
+Chapter
+│
+├── Content
+│
+└── Comments
+```
+
+Features:
+
+* Create comment
+* Edit comment
+* Delete comment
+* Like comment
+* Reply to comment
+
+---
+
+# Paragraph Comments
+
+This is one of WebNovel's strongest features.
+
+When readers highlight or tap a paragraph:
+
+```text
+Paragraph
+```
+
+A comment button appears.
+
+Example:
+
+```text
+Chapter Content
+
+Paragraph 1
+
+Paragraph 2
+      ↑
+Reader taps here
+```
+
+Opens:
+
+```text
+Comment on Paragraph
+```
+
+Benefits:
+
+* Readers react to specific scenes
+* Readers discuss dialogue
+* Readers discuss plot twists
+* Higher engagement
+
+Structure:
+
+```text
+Chapter
+├── Paragraph 1
+│   └── Comments
+│
+├── Paragraph 2
+│   └── Comments
+│
+└── Paragraph 3
+    └── Comments
+```
+
+---
+
+# Reader Interaction System
+
+Readers should be able to:
+
+```text
+Like Paragraph
+Comment Paragraph
+Reply
+Like Reply
+Report Comment
+```
+
+---
+
+# Writing Editor
+
+I would simplify the editor.
+
+You specifically wanted:
+
+```text
+Bold
+Italic
+Heading
+```
+
+Only.
+
+No:
+
+```text
+Lists
+Alignment
+Tables
+Code
+Colors
+Fonts
+```
+
+Those usually make novel editors messy.
+
+---
+
+# Recommended Editor Toolbar
+
+```text
+H1
+B
+I
+```
+
+or
+
+```text
+Heading
+Bold
+Italic
+```
+
+That's it.
+
+---
+
+# Editor Layout
+
+```text
+Book Name
+
+Chapter Title
+
+────────────────────
+
+[H] [B] [I]
+
+────────────────────
+
+Writing Area
+
+────────────────────
+
+Author Note
+```
+
+Simple.
+
+Focused.
+
+Mobile friendly.
+
+---
+
+# Author Notes
+
+At the bottom of every chapter:
+
+```text
+Author's Note
+```
+
+Supports:
+
+* Text
+* Links
+* Announcements
+
+Appears after chapter content.
+
+---
+
+# Additional Feature
+
+Since you're already implementing comments:
+
+Add chapter reactions.
+
+```text
+🔥
+❤️
+😂
+😮
+😭
+```
+
+At the end of each chapter.
+
+This provides instant feedback without forcing users to comment.
+
+---
+
+# Final Writing System
+
+```text
+Write
+│
+├── Works
+│   ├── Books
+│   ├── Characters
+│   ├── Chapters
+│   ├── World
+│   └── Supporters
+│
+├── Editor
+│   ├── Heading
+│   ├── Bold
+│   ├── Italic
+│   ├── Chapter Title
+│   ├── Content
+│   └── Author Note
+│
+├── Publish
+│
+└── Analytics
+```
+
+# Final Reader System
+
+```text
+Reader
+│
+├── Read Chapter
+│
+├── Paragraph Comments
+│
+├── Chapter Comments
+│
+├── Reactions
+│
+├── Flames
+│
+├── Follow Author
+│
+├── Reviews
+│
+└── Supporters
+```
+
+These features would make Mynovel feel much closer to a proper publishing platform rather than simply a book-writing application.
