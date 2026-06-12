@@ -41,6 +41,27 @@
   --card-shadow-lg: 0 12px 36px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.03);
 }
 
+[data-theme="white"] {
+  --bg: #ffffff;
+  --bg-card: rgba(245,245,245,0.75);
+  --bg-hover: #ebebeb;
+  --bg-elevated: rgba(250,250,250,0.9);
+  --text: #1a1a1a;
+  --text2: #666666;
+  --text3: #999999;
+  --accent: #000000;
+  --accent2: #333333;
+  --accent-subtle: rgba(0,0,0,0.04);
+  --line: #e0e0e0;
+  --line2: #f0f0f0;
+  --flame: #1a1a1a;
+  --gold: #1a1a1a;
+  --silver: #666666;
+  --bronze: #999999;
+  --card-shadow: 0 8px 24px rgba(0,0,0,.1), 0 0 0 1px rgba(0,0,0,.04);
+  --card-shadow-lg: 0 12px 36px rgba(0,0,0,.12), 0 0 0 1px rgba(0,0,0,.04);
+}
+
 
 
 
@@ -108,10 +129,17 @@ ul { list-style: none; }
   font-size: 0.5rem; font-weight: 600; letter-spacing: 0.2px; transition: 0.2s;
 }
 .nav-item.active { color: var(--accent); filter: brightness(1.2); }
-.nav-item.active .nav-icon { filter: brightness(0) invert(1); }
+.nav-icon { width: 20px; height: 20px; margin-bottom: 1px; filter: brightness(0) invert(1); }
 .nav-item:not(.active) .nav-icon { opacity: 0.4; }
 .nav-item:not(.active):hover { color: var(--text2); }
-.nav-icon { width: 20px; height: 20px; margin-bottom: 1px; }
+
+/* Invert all UI icons to white on dark backgrounds */
+.prof-stat-icon,
+.prof-action-icon img,
+.prof-section-icon img,
+.prof-achievement-icon,
+.prof-rewards-icon img { filter: brightness(0) invert(1); }
+.prof-icon-dim { opacity: 0.5; }
 
 /* ===== Page ===== */
 .page { padding: 0 20px 24px; }
@@ -370,6 +398,19 @@ textarea.input-field { resize: vertical; min-height: 80px; }
   background: rgba(0,0,2,0.75);
 }
 
+[data-theme="white"] .nav-item.active .nav-icon { filter: brightness(0); }
+[data-theme="white"] .nav-item:not(.active) .nav-icon { filter: brightness(0.4); opacity: 1; }
+[data-theme="white"] .prof-stat-icon,
+[data-theme="white"] .prof-action-icon img:not([src*="google"]):not([src*="facebook"]):not([src*="twitter"]),
+[data-theme="white"] .prof-section-icon img,
+[data-theme="white"] .prof-achievement-icon,
+[data-theme="white"] .prof-rewards-icon img { filter: brightness(0) !important; }
+[data-theme="white"] .notif-badge { color: #fff; }
+[data-theme="white"] .badge-new { color: #fff; }
+[data-theme="white"] .genre-tag.active { color: #fff; }
+[data-theme="white"] .tag-chip.active { color: #fff; }
+[data-theme="white"] .btn-primary { color: #fff; }
+
 /* ===== Author Profile ===== */
 .author-header { margin-bottom: 12px; }
 .author-banner { height: 100px; background: var(--bg-card); border-bottom: 1px solid var(--line); margin: 0 -20px; position: relative; overflow: hidden; }
@@ -499,6 +540,14 @@ textarea.input-field { resize: vertical; min-height: 80px; }
 .book-settings-genre { display: block; font-size: 0.6rem; color: var(--text2); margin-bottom: 2px; }
 .book-settings-status { display: block; font-size: 0.6rem; font-weight: 600; }
 .settings-cover-area { text-align: center; padding: 8px 0; }
+.settings-form { display: flex; flex-direction: column; }
+.settings-label { display: block; font-size: 0.62rem; color: var(--text3); margin-bottom: 4px; }
+.settings-form-row { display: flex; gap: 10px; margin-top: 8px; }
+.settings-form-group { flex: 1; }
+.settings-media-actions { display: flex; justify-content: center; gap: 6px; }
+.settings-divider { height: 1px; background: var(--line); margin: 20px 0; opacity: 0.4; }
+.settings-danger { border-left: 2px solid var(--red); }
+.prof-account-divider { height: 1px; background: var(--line); margin: 32px 0 24px; opacity: 0.3; }
 .settings-cover-area .book-settings-cover { width: 80px; height: 110px; margin: 0 auto; }
 .prof-service-item:hover { color: var(--accent); }
 
@@ -540,13 +589,17 @@ textarea.input-field { resize: vertical; min-height: 80px; }
 .theme-card.active { box-shadow: 0 0 0 1px var(--accent), 0 8px 24px rgba(0,0,0,0.4); }
 .theme-card:hover { background: var(--bg-hover); }
 .theme-preview { width: 56px; height: 42px; border-radius: 6px; overflow: hidden; flex-shrink: 0; }
-.theme-preview-dark { background: #000; }
-.theme-preview-galaxy { background: #000002; }
+.theme-preview-dark { background: #050505; }
+.theme-preview-galaxy { background: #050508; }
+.theme-preview-light { background: #ffffff; border: 1px solid #e0e0e0; }
 .theme-preview-header { height: 8px; background: rgba(255,255,255,0.04); margin-bottom: 2px; }
+.theme-preview-light .theme-preview-header { background: rgba(0,0,0,0.04); }
 .theme-preview-body { padding: 2px 5px; }
 .theme-preview-line { height: 2px; background: rgba(255,255,255,0.06); border-radius: 2px; margin-bottom: 2px; }
+.theme-preview-light .theme-preview-line { background: rgba(0,0,0,0.06); }
 .theme-preview-line.short { width: 50%; }
 .theme-preview-block { height: 12px; background: rgba(255,255,255,0.03); border-radius: 2px; margin-top: 4px; }
+.theme-preview-light .theme-preview-block { background: rgba(0,0,0,0.03); }
 .theme-info { flex: 1; }
 .theme-name { display: block; font-size: 0.78rem; font-weight: 600; }
 .theme-desc { display: block; font-size: 0.58rem; color: var(--text2); margin-top: 1px; }
@@ -605,7 +658,25 @@ textarea.input-field { resize: vertical; min-height: 80px; }
 .end-card, .prof-stat, .prof-rewards, .prof-action, .prof-section,
 .prof-inbox, .theme-card, .ch-list-panel,
 .prof-faq-content, .prof-services-content, .settings-expand-content,
+.settings-danger, .settings-cover-area, .settings-form,
 .author-stat {
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
 }
+
+/* EXP Bar */
+.end-exp-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.end-exp-level { font-size: 0.7rem; font-weight: 700; }
+.end-exp-numbers { font-size: 0.6rem; color: var(--text2); }
+.end-exp-bar { height: 6px; background: var(--bg-hover); border-radius: 3px; overflow: hidden; }
+.end-exp-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.5s; }
+
+/* Revision History */
+.rev-item:hover { background: var(--bg-hover); }
+
+/* Flame rules */
+.end-flame-rules { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 6px; }
+.end-flame-rules span { font-size: 0.55rem; color: var(--text3); }
+
+/* Editor autosave status */
+#editor-autosave-status { font-size: 0.6rem; color: var(--text3); margin-right: 6px; }

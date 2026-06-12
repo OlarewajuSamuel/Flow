@@ -3,13 +3,6 @@
 // ============================================================
 const GENRES = ['Fantasy','Sci-Fi','Action','Romance','Horror','Mystery','Adventure','Comedy','Drama','Thriller'];
 const TAGS = ['System','Magic','Reincarnation','Academy','Kingdom Building','Apocalypse','Cultivation','Martial Arts','Survival','Mystery','Adventure','Romance','Comedy','Tragedy','Slice of Life'];
-const READER_REACTIONS = [
-  { id: 'love', label: 'Loved It' },
-  { id: 'hype', label: 'Hype' },
-  { id: 'emotional', label: 'Emotional' },
-  { id: 'surprised', label: 'Surprised' },
-  { id: 'funny', label: 'Funny' },
-];
 
 // ============================================================
 // STATE & ACCOUNTS (persisted to localStorage)
@@ -30,7 +23,7 @@ function getState() {
   const defaults = {
     theme: 'dark',
     loggedIn: false,
-    user: { username: 'Guest', bio: '', level: 1, rank: 0, followers: 0, email: '', avatar: '', banner: '', website: '', discord: '', twitter: '', facebook: '', joinDate: '' },
+    user: { username: 'Guest', bio: '', level: 1, exp: 0, lifetime_exp: 0, rank: 0, followers: 0, email: '', avatar: '', banner: '', website: '', discord: '', twitter: '', facebook: '', joinDate: '' },
     books: [],
     chapters: {},
     characters: {},
@@ -42,9 +35,12 @@ function getState() {
     notifications: [],
     flameDate: '',
     flamesGiven: 0,
+    flameAllowance: 2,
+    flamesRemaining: 2,
     reviews: {},
     chapterComments: {},
     chapterReactions: {},
+    readingProgress: [],
   };
   try {
     const saved = localStorage.getItem('novelState');
@@ -84,16 +80,302 @@ async function apiFetch(path, opts = {}) {
   } catch (e) { return null; }
 }
 
+let serverOnline = false;
+async function checkServer() {
+  const data = await apiFetch('/api/auth/me');
+  serverOnline = data !== null;
+  return serverOnline;
+}
+
 // Try backend auth; fall back to localStorage
 async function initAuth() {
   const data = await apiFetch('/api/auth/me');
   if (data && data.loggedIn) {
+    serverOnline = true;
     state.loggedIn = true;
     state.user = { ...state.user, ...data.user };
     saveState();
-  } else if (state.loggedIn && state.user.email && accounts[state.user.email]) {
+    // Load user data from server
+    loadServerData();
+    return;
+  }
+  if (state.loggedIn && state.user.email && accounts[state.user.email]) {
     loginAs(state.user.email);
   }
+}
+
+// ── Server data sync ────────────────────────────
+async function loadServerData() {
+  if (!serverOnline) return;
+  // Load books
+  const books = await apiFetch('/api/books');
+  if (books && Array.isArray(books)) {
+    state.books = books;
+    // Load chapters for each book
+    for (const book of books) {
+      const chapters = await apiFetch(`/api/books/${book.id}/chapters`);
+      if (chapters && Array.isArray(chapters)) state.chapters[book.id] = chapters;
+      const chars = await apiFetch(`/api/books/${book.id}/characters`);
+      if (chars && Array.isArray(chars)) state.characters[book.id] = chars;
+      // Load reviews
+      const reviews = await apiFetch(`/api/books/${book.id}/reviews`);
+      if (reviews && Array.isArray(reviews)) state.reviews[book.id] = reviews;
+      // Load flames
+      const f = await apiFetch(`/api/books/${book.id}/flames`);
+      if (f) book.serverFlames = f.total;
+    }
+  }
+  // Load user profile
+  const userData = await apiFetch(`/api/user/${state.user.id}`);
+  if (userData) {
+    state.user.level = userData.level;
+    state.user.exp = userData.exp;
+    state.user.lifetime_exp = userData.lifetime_exp;
+    state.user.followers = userData.followers;
+    if (userData.avatar) state.user.avatar = userData.avatar;
+    if (userData.banner) state.user.banner = userData.banner;
+    if (userData.bio && !state.user.bio) state.user.bio = userData.bio;
+  }
+  // Load exp info
+  const expData = await apiFetch('/api/user/exp');
+  if (expData) {
+    state.user.level = expData.level;
+    state.user.exp = expData.exp;
+    state.user.lifetime_exp = expData.lifetime;
+  }
+  // Load remaining flames
+  const flameData = await apiFetch('/api/user/flames/remaining');
+  if (flameData) {
+    state.flameAllowance = flameData.allowance;
+    state.flamesRemaining = flameData.remaining;
+  }
+  // Load notifications
+  const notifs = await apiFetch('/api/user/notifications');
+  if (notifs && Array.isArray(notifs)) state.notifications = notifs;
+  // Load favorites
+  const favs = await apiFetch('/api/user/favorites');
+  if (favs && Array.isArray(favs)) state.favorites = favs.map(b => b.id);
+  // Load reading progress
+  const progress = await apiFetch('/api/user/progress');
+  if (progress && Array.isArray(progress)) state.readingProgress = progress;
+  saveState();
+}
+
+// ── API Wrappers (fire-and-forget sync) ──────────
+async function apiSync(method, path, body) {
+  if (!serverOnline) return null;
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await apiFetch(path, opts);
+  if (!res) { serverOnline = false; }
+  return res;
+}
+
+async function syncCreateBook(book) {
+  const res = await apiSync('POST', '/api/books', {
+    title: book.title, synopsis: book.synopsis, genre: book.genre,
+    type: book.type, tags: book.tags, cover: book.cover,
+    status: book.status, visibility: 'public'
+  });
+  if (res) book.serverId = res.id;
+}
+
+async function syncUpdateBook(id, data) {
+  await apiSync('PUT', `/api/books/${id}`, data);
+}
+
+async function syncDeleteBook(id) {
+  await apiSync('DELETE', `/api/books/${id}`);
+}
+
+async function syncPublishBook(id) {
+  const res = await apiSync('PUT', `/api/books/${id}/publish`);
+  return res ? res.published : undefined;
+}
+
+async function syncCreateChapter(bookId, chapter) {
+  const res = await apiSync('POST', `/api/books/${bookId}/chapters`, {
+    title: chapter.title, content: chapter.content, published: chapter.published
+  });
+  if (res) chapter.serverId = res.id;
+}
+
+async function syncUpdateChapter(chapterId, data) {
+  await apiSync('PUT', `/api/chapters/${chapterId}`, data);
+}
+
+async function syncDeleteChapter(chapterId) {
+  await apiSync('DELETE', `/api/chapters/${chapterId}`);
+}
+
+async function syncCreateCharacter(bookId, char) {
+  const res = await apiSync('POST', `/api/books/${bookId}/characters`, {
+    name: char.name, biography: char.description, portrait: char.image
+  });
+  if (res) char.serverId = res.id;
+}
+
+async function syncDeleteCharacter(charId) {
+  await apiSync('DELETE', `/api/characters/${charId}`);
+}
+
+async function syncRecordView(bookId) {
+  await apiSync('POST', `/api/books/${bookId}/view`);
+}
+
+async function syncGetFlamesRemaining() {
+  const res = await apiSync('GET', '/api/user/flames/remaining');
+  return res;
+}
+
+async function syncGiveFlame(bookId) {
+  const res = await apiSync('POST', `/api/books/${bookId}/flame`);
+  return res;
+}
+
+async function syncGiveSingleFlame(chapterId) {
+  const res = await apiSync('POST', `/api/chapters/${chapterId}/flame`);
+  return res;
+}
+
+async function syncAwardExp(amount, reason) {
+  const res = await apiSync('POST', '/api/user/exp/gain', { amount, reason });
+  return res;
+}
+
+async function syncUpdateProgress(bookId, data) {
+  const res = await apiSync('PUT', `/api/user/progress/${bookId}`, data);
+  return res;
+}
+
+async function syncCreateReview(bookId, review) {
+  const res = await apiSync('POST', `/api/books/${bookId}/reviews`, review);
+  return res;
+}
+
+async function syncDeleteReview(reviewId) {
+  await apiSync('DELETE', `/api/reviews/${reviewId}`);
+}
+
+async function syncTogglePinReview(reviewId) {
+  const res = await apiSync('PUT', `/api/reviews/${reviewId}/pin`);
+  return res;
+}
+
+async function syncToggleFavoriteReview(reviewId) {
+  const res = await apiSync('PUT', `/api/reviews/${reviewId}/like`);
+  return res ? res.likes : null;
+}
+
+async function syncCreateComment(chapterId, content) {
+  const res = await apiSync('POST', `/api/chapters/${chapterId}/comments`, { content });
+  return res;
+}
+
+async function syncDeleteComment(commentId) {
+  await apiSync('DELETE', `/api/comments/${commentId}`);
+}
+
+async function syncGetReviews(bookId) {
+  const res = await apiSync('GET', `/api/books/${bookId}/reviews`);
+  return res;
+}
+
+async function syncGetChapterComments(chapterId) {
+  const res = await apiSync('GET', `/api/chapters/${chapterId}/comments`);
+  return res;
+}
+
+async function syncGetRevisions(chapterId) {
+  const res = await apiSync('GET', `/api/chapters/${chapterId}/revisions`);
+  return res;
+}
+
+async function syncGetRevision(chapterId, revId) {
+  const res = await apiSync('GET', `/api/chapters/${chapterId}/revisions/${revId}`);
+  return res;
+}
+
+async function syncRestoreRevision(chapterId, revId) {
+  const res = await apiSync('POST', `/api/chapters/${chapterId}/revisions/${revId}/restore`);
+  return res;
+}
+
+async function syncFollow(userId) {
+  const res = await apiSync('POST', `/api/follow/${userId}`);
+  return res;
+}
+
+async function syncCheckFollow(userId) {
+  const res = await apiSync('GET', `/api/follow/check/${userId}`);
+  return res ? res.following : false;
+}
+
+async function syncToggleFavorite(bookId) {
+  const res = await apiSync('POST', `/api/favorites/${bookId}`);
+  return res ? res.favorited : undefined;
+}
+
+async function syncUpdateProfile(data) {
+  const res = await apiSync('PUT', '/api/user/profile', data);
+  return res;
+}
+
+async function syncUpdateSettings(data) {
+  const res = await apiSync('PUT', '/api/user/settings', data);
+  return res;
+}
+
+// EXP/Level helpers
+function expForLevel(lvl) { return lvl * 100; }
+function dailyFlameAllowance(lvl) { return lvl >= 21 ? 5 : lvl >= 11 ? 4 : lvl >= 5 ? 3 : 2; }
+
+async function gainExp(amount, reason) {
+  if (serverOnline) {
+    const res = await syncAwardExp(amount, reason);
+    if (res) {
+      state.user.level = res.level;
+      state.user.exp = res.exp;
+      state.user.lifetime_exp = (state.user.lifetime_exp || 0) + amount;
+      if (res.leveledUp) {
+        state.user.flameAllowance = dailyFlameAllowance(res.level);
+        state.user.flamesRemaining = state.user.flameAllowance;
+        showToast(`Level Up! You are now level ${res.level}`);
+      }
+      saveState();
+      return res;
+    }
+  }
+  // Fallback: local EXP
+  if (!state.user.exp) state.user.exp = 0;
+  if (!state.user.level) state.user.level = 1;
+  state.user.exp = (state.user.exp || 0) + amount;
+  state.user.lifetime_exp = (state.user.lifetime_exp || 0) + amount;
+  while (state.user.exp >= expForLevel(state.user.level)) {
+    state.user.exp -= expForLevel(state.user.level);
+    state.user.level++;
+    const newAllowance = dailyFlameAllowance(state.user.level);
+    state.flameAllowance = newAllowance;
+    state.flamesRemaining = newAllowance;
+    showToast(`Level Up! You are now level ${state.user.level}`);
+  }
+  saveState();
+  return { level: state.user.level, exp: state.user.exp, needed: expForLevel(state.user.level) };
+}
+
+// ── Toast notifications ──────────────────────────
+function showToast(msg, duration) {
+  let el = document.getElementById('toast-msg');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast-msg';
+    el.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:var(--bg-card);color:var(--text);padding:10px 20px;border-radius:8px;font-size:0.75rem;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,0.4);backdrop-filter:blur(12px);transition:opacity 0.3s;text-align:center;max-width:80%';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.opacity = '1';
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.style.opacity = '0'; }, duration || 2000);
 }
 
 // ============================================================
@@ -121,7 +403,7 @@ function createBook(data) {
     genre: data.genre || '',
     tags: (data.tags || '').split(',').map(t => t.trim()).filter(Boolean),
     type: data.type || 'Novel',
-    status: 'Draft',
+    status: data.status || 'Draft',
     chapterCount: 0,
     views: 0,
     favorites: 0,
@@ -137,6 +419,7 @@ function createBook(data) {
   state.chapters[book.id] = [];
   state.characters[book.id] = [];
   saveState();
+  syncCreateBook(book);
   return book;
 }
 
@@ -145,6 +428,7 @@ function updateBook(id, data) {
   if (!book) return;
   Object.assign(book, data, { updatedAt: today() });
   saveState();
+  syncUpdateBook(id, data);
 }
 
 function deleteBook(id) {
@@ -154,6 +438,7 @@ function deleteBook(id) {
   state.favorites = state.favorites.filter(f => f !== id);
   delete state.flames[id];
   saveState();
+  syncDeleteBook(id);
 }
 
 function createChapter(bookId, data) {
@@ -176,6 +461,7 @@ function createChapter(bookId, data) {
     book.updatedAt = today();
   }
   saveState();
+  syncCreateChapter(bookId, chapter);
   return chapter;
 }
 
@@ -185,6 +471,7 @@ function updateChapter(bookId, chapterId, data) {
   if (!ch) return;
   Object.assign(ch, data, { updatedAt: today() });
   saveState();
+  syncUpdateChapter(chapterId, data);
 }
 
 function deleteChapter(bookId, chapterId) {
@@ -195,6 +482,7 @@ function deleteChapter(bookId, chapterId) {
     book.updatedAt = today();
   }
   saveState();
+  syncDeleteChapter(chapterId);
 }
 
 function createCharacter(bookId, data) {
@@ -203,12 +491,15 @@ function createCharacter(bookId, data) {
   chars.push(ch);
   state.characters[bookId] = chars;
   saveState();
+  syncCreateCharacter(bookId, ch);
   return ch;
 }
 
 function deleteCharacter(bookId, charId) {
+  const ch = (state.characters[bookId] || []).find(c => c.id === charId);
   state.characters[bookId] = (state.characters[bookId] || []).filter(c => c.id !== charId);
   saveState();
+  syncDeleteCharacter(ch && ch.serverId ? ch.serverId : charId);
 }
 
 function toggleFavorite(bookId) {
@@ -223,28 +514,44 @@ function toggleFavorite(bookId) {
     if (book) book.favorites = (book.favorites || 0) + 1;
   }
   saveState();
+  syncToggleFavorite(bookId);
 }
 
 function giveFlames(bookId) {
-  const today = new Date().toDateString();
-  if (state.flameDate !== today) {
-    state.flameDate = today;
+  const book = getBook(bookId);
+  if (!book || book.author === state.user.username) return false;
+
+  // Try server first
+  if (serverOnline) {
+    syncGiveFlame(bookId).then(res => {
+      if (res) {
+        state.flamesRemaining = res.remaining;
+        book.flames = res.bookFlames;
+        if (res.expGained) gainExp(res.expGained, 'flame');
+        saveState();
+        renderApp();
+      }
+    });
+    return true;
+  }
+
+  // Fallback localStorage
+  const todayStr = new Date().toDateString();
+  if (state.flameDate !== todayStr) {
+    state.flameDate = todayStr;
     state.flamesGiven = 0;
   }
 
   const level = state.user.level || 1;
-  const maxFlames = level >= 5 ? 3 : 2;
+  const maxFlames = dailyFlameAllowance(level);
   const remaining = Math.max(0, maxFlames - state.flamesGiven);
   if (remaining <= 0) return false;
-
-  const book = getBook(bookId);
-  if (!book || book.author === state.user.username) return false;
 
   if (!state.flames[bookId]) state.flames[bookId] = 0;
   state.flames[bookId] += remaining;
   book.flames = (book.flames || 0) + remaining;
   state.flamesGiven += remaining;
-  state.supporterHistory.push({ user: state.user.username, amount: remaining, book: book.title, date: new Date().toISOString() });
+  gainExp(remaining * 10, 'flame');
   saveState();
   return true;
 }
@@ -257,6 +564,7 @@ function recordView(bookId) {
   if (!book.dailyViews) book.dailyViews = {};
   book.dailyViews[d] = (book.dailyViews[d] || 0) + 1;
   saveState();
+  syncRecordView(bookId);
 }
 
 // ---- Review CRUD ----
@@ -268,6 +576,8 @@ function createReview(bookId, data) {
   reviews.push(r);
   state.reviews[bookId] = reviews;
   saveState();
+  gainExp(20, 'review');
+  syncCreateReview(bookId, data);
   return r;
 }
 
@@ -283,6 +593,7 @@ function updateReview(bookId, reviewId, data) {
 function deleteReview(bookId, reviewId) {
   state.reviews[bookId] = getReviews(bookId).filter(x => x.id !== reviewId);
   saveState();
+  syncDeleteReview(reviewId);
 }
 
 function togglePinReview(bookId, reviewId) {
@@ -292,6 +603,7 @@ function togglePinReview(bookId, reviewId) {
   r.pinned = !r.pinned;
   state.reviews[bookId] = reviews;
   saveState();
+  syncTogglePinReview(reviewId);
 }
 
 function toggleFavoriteReview(bookId, reviewId) {
@@ -301,6 +613,7 @@ function toggleFavoriteReview(bookId, reviewId) {
   r.favorited = !r.favorited;
   state.reviews[bookId] = reviews;
   saveState();
+  syncToggleFavoriteReview(reviewId);
 }
 
 function replyToReview(bookId, reviewId, content) {
@@ -324,43 +637,38 @@ function createChapterComment(bookId, chapterId, content) {
   const c = { id: genId(), username: state.user.username, content, createdAt: new Date().toLocaleDateString() };
   state.chapterComments[key].push(c);
   saveState();
+  gainExp(10, 'comment');
+  syncCreateComment(chapterId, content);
   return c;
 }
 function deleteChapterComment(bookId, chapterId, commentId) {
   const key = bookId + '_' + chapterId;
   state.chapterComments[key] = (state.chapterComments[key] || []).filter(c => c.id !== commentId);
   saveState();
+  syncDeleteComment(commentId);
 }
 
-// ---- Chapter Reactions ----
-function getChapterReactions(bookId, chapterId) {
-  const key = bookId + '_' + chapterId;
-  return state.chapterReactions[key] || {};
-}
-function toggleChapterReaction(bookId, chapterId, reactionId) {
-  const key = bookId + '_' + chapterId;
-  if (!state.chapterReactions[key]) state.chapterReactions[key] = {};
-  const r = state.chapterReactions[key];
-  if (!r[reactionId]) r[reactionId] = [];
-  const idx = r[reactionId].indexOf(state.user.username);
-  if (idx > -1) { r[reactionId].splice(idx, 1); }
-  else { r[reactionId].push(state.user.username); }
-  saveState();
-  return r;
-}
 function giveSingleFlame(bookId) {
-  const today = new Date().toDateString();
-  if (state.flameDate !== today) { state.flameDate = today; state.flamesGiven = 0; }
-  const level = state.user.level || 1;
-  const maxFlames = level >= 5 ? 3 : 2;
-  if (state.flamesGiven >= maxFlames) return false;
   const book = getBook(bookId);
   if (!book || book.author === state.user.username) return false;
+
+  if (serverOnline) {
+    const ch = state.chapters[bookId];
+    const chId = ch && ch.length ? ch[ch.length-1].id : '';
+    const endpoint = chId ? syncGiveSingleFlame(chId) : syncGiveFlame(bookId);
+    return true;
+  }
+
+  const todayStr = new Date().toDateString();
+  if (state.flameDate !== todayStr) { state.flameDate = todayStr; state.flamesGiven = 0; }
+  const level = state.user.level || 1;
+  const maxFlames = dailyFlameAllowance(level);
+  if (state.flamesGiven >= maxFlames) return false;
   if (!state.flames[bookId]) state.flames[bookId] = 0;
   state.flames[bookId] += 1;
   book.flames = (book.flames || 0) + 1;
   state.flamesGiven += 1;
-  state.supporterHistory.push({ user: state.user.username, amount: 1, book: book.title, date: new Date().toISOString() });
+  gainExp(10, 'flame');
   saveState();
   return true;
 }
@@ -603,7 +911,7 @@ function renderWriteWorks() {
 function renderCreateBook() {
   return `
     <div class="page write-page">
-      <a class="back-link" href="#/write">Back to Works</a>
+      <a class="back-link" href="#/write"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back to Works</a>
       <h1 class="page-title">Create New Book</h1>
       <form id="create-book-form" style="display:flex;flex-direction:column;gap:14px">
         <div class="form-group">
@@ -686,7 +994,7 @@ function renderWorkspaceBook(id) {
 
   return `
     <div class="page">
-      <a class="back-link" href="#/write">Back to Works</a>
+      <a class="back-link" href="#/write"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back to Works</a>
 
       <!-- Book Header -->
       <div class="book-settings-header" style="margin-bottom:14px">
@@ -715,22 +1023,22 @@ function renderWorkspaceBook(id) {
           <!-- Quick Actions -->
           <div class="prof-sections">
             <div class="prof-section" onclick="navigate('#/write/works/${id}/chapters/new')" style="cursor:pointer">
-              <div class="prof-section-icon">+</div>
+              <div class="prof-section-icon"><img src="Icons/editpen.png" width="20"></div>
               <div class="prof-section-body"><span class="prof-section-title">Add Chapter</span><span class="prof-section-desc">Write a new chapter</span></div>
               <div class="prof-section-arrow">&gt;</div>
             </div>
             <div class="prof-section" onclick="navigate('#/write/works/${id}/characters/new')" style="cursor:pointer">
-              <div class="prof-section-icon">+</div>
+              <div class="prof-section-icon"><img src="Icons/person-plus.png" width="20"></div>
               <div class="prof-section-body"><span class="prof-section-title">Add Character</span><span class="prof-section-desc">Create a new character</span></div>
               <div class="prof-section-arrow">&gt;</div>
             </div>
             <div class="prof-section" onclick="wsTab='Analytics';render()" style="cursor:pointer">
-              <div class="prof-section-icon">*</div>
+              <div class="prof-section-icon"><img src="Icons/graph.png" width="20"></div>
               <div class="prof-section-body"><span class="prof-section-title">Analytics</span><span class="prof-section-desc">View performance data</span></div>
               <div class="prof-section-arrow">&gt;</div>
             </div>
             <div class="prof-section" onclick="wsTab='Settings';render()" style="cursor:pointer">
-              <div class="prof-section-icon">#</div>
+              <div class="prof-section-icon"><img src="Icons/settings.png" width="20"></div>
               <div class="prof-section-body"><span class="prof-section-title">Settings</span><span class="prof-section-desc">Manage book settings</span></div>
               <div class="prof-section-arrow">&gt;</div>
             </div>
@@ -747,7 +1055,7 @@ function renderWorkspaceBook(id) {
         ` : wsTab === 'Chapters' ? `
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
             <h3 style="font-size:0.85rem;font-weight:600">Chapters (${chapters.length})</h3>
-            <button class="btn btn-sm" onclick="navigate('#/write/works/${id}/chapters/new')">+ Add Chapter</button>
+            <button class="btn btn-sm" onclick="navigate('#/write/works/${id}/chapters/new')"><img src="Icons/editpen.png" width="12" style="vertical-align:middle;margin-right:4px">Add Chapter</button>
           </div>
           ${chapters.length ? `<div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap">
             <span style="font-size:0.6rem;color:var(--text3)">${publishedChs.length} Published</span>
@@ -767,7 +1075,7 @@ function renderWorkspaceBook(id) {
         ` : wsTab === 'Characters' ? `
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
             <h3 style="font-size:0.85rem;font-weight:600">Characters (${chars.length})</h3>
-            <button class="btn btn-sm" onclick="navigate('#/write/works/${id}/characters/new')">+ Add Character</button>
+            <button class="btn btn-sm" onclick="navigate('#/write/works/${id}/characters/new')"><img src="Icons/person-plus.png" width="12" style="vertical-align:middle;margin-right:4px">Add Character</button>
           </div>
           ${chars.length ? chars.map(c => `
             <div class="char-item">
@@ -840,16 +1148,7 @@ function renderWorkspaceBook(id) {
             </div>
           </section>
         ` : `
-          <!-- Settings Tab using prof-section pattern -->
-          <div class="book-settings-header" style="margin-bottom:16px;padding:16px;background:var(--bg-card);border-radius:var(--r);box-shadow:0 4px 12px rgba(0,0,0,0.2)">
-            <div class="book-settings-cover${coverImg ? ' has-cover' : ''}" style="${coverImg ? 'background-image:url(' + coverImg + ')' : ''}">${coverImg ? '' : book.title[0]}</div>
-            <div class="book-settings-meta">
-              <div class="book-settings-title">${book.title}</div>
-              <span class="book-settings-genre">${book.genre || 'Uncategorized'} | ${book.type}</span>
-              <span class="book-settings-status" style="color:${book.status==='Draft'?'var(--text3)':book.status==='Completed'?'var(--accent)':'var(--text2)'}">${book.status}</span>
-            </div>
-          </div>
-
+          <!-- Settings Tab -->
           <div class="prof-stats" style="margin-bottom:16px">
             <div class="prof-stat"><div class="prof-stat-val">${fmt(book.chapterCount)}</div><div class="prof-stat-lbl">Chapters</div></div>
             <div class="prof-stat"><div class="prof-stat-val">${fmt(totalViews)}</div><div class="prof-stat-lbl">Views</div></div>
@@ -857,57 +1156,67 @@ function renderWorkspaceBook(id) {
             <div class="prof-stat"><div class="prof-stat-val">${fmt(book.favorites)}</div><div class="prof-stat-lbl">Followers</div></div>
           </div>
 
-          <div class="prof-sections">
-
-            <!-- Edit Book Info -->
-            <div class="prof-section" onclick="alert('Edit book info is not yet implemented')" style="cursor:pointer">
-              <div class="prof-section-icon">#</div>
-              <div class="prof-section-body"><span class="prof-section-title">Edit Book Information</span><span class="prof-section-desc">Change title, synopsis, genre</span></div>
-              <div class="prof-section-arrow">&gt;</div>
+          <!-- Book Details -->
+          <div class="content-section" style="margin-bottom:12px">
+            <h3 class="section-title" style="margin-bottom:12px">Book Details</h3>
+            <div class="settings-form">
+              <label class="settings-label">Title</label>
+              <input class="input-field" id="settings-details-title" value="${book.title}">
+              <label class="settings-label" style="margin-top:8px">Synopsis</label>
+              <textarea class="input-field" id="settings-details-synopsis" rows="4">${(book.synopsis || '').replace(/</g,'&lt;')}</textarea>
+              <div class="settings-form-row">
+                <div class="settings-form-group">
+                  <label class="settings-label">Genre</label>
+                  <select class="input-field" id="settings-details-genre">${GENRES.map(g => `<option value="${g}"${book.genre===g?' selected':''}>${g}</option>`).join('')}</select>
+                </div>
+                <div class="settings-form-group">
+                  <label class="settings-label">Type</label>
+                  <select class="input-field" id="settings-details-type"><option value="Novel"${book.type==='Novel'?' selected':''}>Novel</option><option value="Fanfic"${book.type==='Fanfic'?' selected':''}>Fanfic</option></select>
+                </div>
+              </div>
+              <label class="settings-label">Status</label>
+              <select class="input-field" id="settings-details-status">
+                <option value="Ongoing"${book.status==='Ongoing'?' selected':''}>Ongoing</option>
+                <option value="Completed"${book.status==='Completed'?' selected':''}>Completed</option>
+                <option value="Hiatus"${book.status==='Hiatus'?' selected':''}>Hiatus</option>
+              </select>
+              <label class="settings-label" style="margin-top:8px">Tags</label>
+              <input class="input-field" id="settings-details-tags" value="${(book.tags||[]).join(', ')}">
+              <span style="font-size:0.55rem;color:var(--text3);display:block;margin-bottom:8px">Separate tags with commas</span>
+              <button class="btn btn-sm" id="settings-details-save" data-book="${id}" style="background:rgba(255,255,255,0.1);color:var(--accent)">Save Changes</button>
             </div>
+          </div>
 
-            <!-- Change Cover (expandable) -->
-            <div class="prof-section" id="settings-cover-toggle" style="cursor:pointer">
-              <div class="prof-section-icon">*</div>
-              <div class="prof-section-body"><span class="prof-section-title">Change Cover</span><span class="prof-section-desc">Upload or remove book cover image</span></div>
-              <div class="prof-section-arrow" id="settings-cover-arrow">+</div>
-            </div>
-            <div class="settings-expand-content" id="settings-cover-content" style="display:none">
-              <div class="settings-cover-area">
-                <div class="book-settings-cover${coverImg ? ' has-cover' : ''}" style="width:80px;height:110px;margin:0 auto;${coverImg ? 'background-image:url(' + coverImg + ')' : ''}">${coverImg ? '' : book.title[0]}</div>
-                <input type="file" id="settings-cover-input" accept="image/*" style="display:none">
-                <label for="settings-cover-input" class="btn btn-sm" style="margin-top:8px;display:inline-block">Upload Image</label>
-                ${coverImg ? `<button class="btn btn-sm" id="settings-cover-remove" style="color:var(--red);margin-left:6px">Remove</button>` : ''}
+          <!-- Media -->
+          <div class="content-section" style="margin-bottom:12px">
+            <h3 class="section-title" style="margin-bottom:12px">Media</h3>
+            <div class="settings-cover-area">
+              <div class="book-settings-cover${coverImg ? ' has-cover' : ''}" style="width:80px;height:110px;margin:0 auto;background-size:cover;background-position:center;${coverImg ? 'background-image:url(' + coverImg + ')' : ''}">${coverImg ? '' : book.title[0]}</div>
+              <input type="file" id="settings-cover-input" accept="image/*" style="display:none">
+              <div class="settings-media-actions">
+                <label for="settings-cover-input" class="btn btn-sm" style="margin-top:8px;display:inline-block">${coverImg ? 'Replace Cover' : 'Upload Cover'}</label>
+                ${coverImg ? `<button class="btn btn-sm" id="settings-cover-remove" style="color:var(--red);margin-left:6px;margin-top:8px">Remove Cover</button>` : ''}
               </div>
             </div>
+          </div>
 
-            <!-- Publishing Settings (expandable) -->
-            <div class="prof-section" id="settings-pub-toggle" style="cursor:pointer">
-              <div class="prof-section-icon">!</div>
-              <div class="prof-section-body"><span class="prof-section-title">Publishing Settings</span><span class="prof-section-desc">Status and visibility controls</span></div>
-              <div class="prof-section-arrow" id="settings-pub-arrow">+</div>
-            </div>
-            <div class="settings-expand-content" id="settings-pub-content" style="display:none">
-              <div class="prof-faq-item"><strong>Status</strong><p>Current: ${book.status}</p></div>
-              <div class="prof-faq-item"><strong>Visibility</strong><p>${book.status === 'Draft' ? 'Only you can see this book' : 'Anyone can read this book'}</p></div>
-              <button class="btn btn-sm" id="settings-publish-btn" data-book="${id}" style="background:rgba(255,255,255,0.1);color:var(--accent);margin-top:6px">${book.status === 'Draft' ? 'Publish Book' : 'Unpublish Book'}</button>
-            </div>
+          <!-- Publishing -->
+          <div class="content-section" style="margin-bottom:12px">
+            <h3 class="section-title" style="margin-bottom:12px">Publishing</h3>
+            <div class="prof-faq-item"><strong>Visibility</strong><p>${book.status === 'Draft' ? 'Private - Only you can see this book' : 'Public - Anyone can read this book'}</p></div>
+            <div class="prof-faq-item"><strong>Publication State</strong><p>${book.status === 'Draft' ? 'Unpublished' : 'Published'}</p></div>
+            <div class="prof-faq-item"><strong>Reader Access</strong><p>${book.status === 'Draft' ? 'Not accessible to readers' : book.status === 'Completed' ? 'All chapters available' : 'New chapters in progress'}</p></div>
+            <button class="btn btn-sm" id="settings-publish-btn" data-book="${id}" style="background:rgba(255,255,255,0.1);color:var(--accent);margin-top:6px">${book.status === 'Draft' ? 'Publish Book' : 'Unpublish Book'}</button>
+          </div>
 
-            <!-- Unpublish Book (danger card) -->
-            ${book.status !== 'Draft' ? `
-            <div class="prof-section" id="settings-unpublish-btn" data-book="${id}" style="cursor:pointer;border-left:2px solid var(--warning);margin-top:6px">
-              <div class="prof-section-icon">x</div>
-              <div class="prof-section-body"><span class="prof-section-title" style="color:var(--warning)">Unpublish Book</span><span class="prof-section-desc">Hide from public view</span></div>
-              <div class="prof-section-arrow">&gt;</div>
-            </div>` : ''}
+          <!-- Divider -->
+          <div class="settings-divider"></div>
 
-            <!-- Delete Book (danger card) -->
-            <div class="prof-section" id="settings-delete-btn" data-book="${id}" style="cursor:pointer;border-left:2px solid var(--red);margin-top:6px">
-              <div class="prof-section-icon">x</div>
-              <div class="prof-section-body"><span class="prof-section-title" style="color:var(--red)">Delete Book</span><span class="prof-section-desc">Permanently delete this book</span></div>
-              <div class="prof-section-arrow">&gt;</div>
-            </div>
-
+          <!-- Danger Zone -->
+          <div class="content-section settings-danger">
+            <h3 class="section-title" style="color:var(--red);margin-bottom:8px">Danger Zone</h3>
+            <p style="font-size:0.65rem;color:var(--text3);margin-bottom:10px;line-height:1.5">Once you delete a book, there is no going back. Please be certain.</p>
+            <button class="btn btn-sm" id="settings-delete-btn" data-book="${id}" style="background:var(--red);color:#fff">Delete Book</button>
           </div>
         `}
       </div>
@@ -932,8 +1241,8 @@ function renderCreateChapter(bookId) {
           <textarea class="input-field" name="content" placeholder="Write your chapter..." rows="12" style="min-height:200px"></textarea>
         </div>
         <div style="display:flex;gap:8px">
-          <button type="submit" class="btn btn-primary" style="flex:1">Save Draft</button>
-          <button type="button" class="btn btn-sm ws-save-publish" data-book="${bookId}" style="flex:1;background:rgba(255,255,255,0.1);color:var(--accent)">Save & Publish</button>
+          <button type="submit" class="btn btn-primary" style="flex:1"><img src="Icons/settings.png" width="12" style="vertical-align:middle;margin-right:4px">Save Draft</button>
+          <button type="button" class="btn btn-sm ws-save-publish" data-book="${bookId}" style="flex:1;background:rgba(255,255,255,0.1);color:var(--accent)"><img src="Icons/editpen.png" width="12" style="vertical-align:middle;margin-right:4px">Save &amp; Publish</button>
         </div>
       </form>
     </div>`;
@@ -967,7 +1276,7 @@ function renderCreateCharacter(bookId) {
           <label>Description</label>
           <textarea class="input-field" name="description" placeholder="Describe your character..." rows="4"></textarea>
         </div>
-        <button type="submit" class="btn btn-primary">Add Character</button>
+        <button type="submit" class="btn btn-primary"><img src="Icons/person-plus.png" width="12" style="vertical-align:middle;margin-right:4px">Add Character</button>
       </form>
     </div>`;
 }
@@ -981,14 +1290,35 @@ function renderEditor(bookId, chapterId) {
   return `
     <div style="display:flex;flex-direction:column;height:100vh;background:var(--bg)">
       <div style="display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--bg-card);box-shadow:0 2px 8px rgba(0,0,0,0.2)">
-        <a class="back-link" href="#/write/works/${bookId}" style="padding:0;font-size:0.85rem">[back]</a>
+        <a class="back-link" href="#/write/works/${bookId}" style="padding:0;font-size:0.85rem"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back</a>
         <span style="flex:1;font-size:0.82rem;font-weight:600">${book.title} - Ch.${chapter.chapterNumber}</span>
-        <button class="btn btn-sm ed-save" data-book="${bookId}" data-ch="${chapterId}" style="font-size:0.65rem">Save</button>
+        <span id="editor-autosave-status" style="font-size:0.6rem;color:var(--text3);margin-right:6px"></span>
+        <button class="btn btn-sm ed-save" data-book="${bookId}" data-ch="${chapterId}" style="font-size:0.65rem"><img src="Icons/settings.png" width="12" style="vertical-align:middle;margin-right:4px">Save</button>
+        <button class="btn btn-sm ed-revisions" data-book="${bookId}" data-ch="${chapterId}" style="font-size:0.65rem"><img src="Icons/books-stack-of-three.png" width="12" style="vertical-align:middle;margin-right:4px">History</button>
         <button class="btn btn-primary ed-publish" data-book="${bookId}" data-ch="${chapterId}" style="padding:5px 12px;font-size:0.65rem">${chapter.published?'Unpublish':'Publish'}</button>
       </div>
       <div style="flex:1;display:flex;flex-direction:column;padding:16px 20px;overflow-y:auto">
         <input id="editor-title" class="input-field" style="font-size:1rem;font-weight:700;border:none;padding:4px 0;margin-bottom:12px;background:transparent" value="${chapter.title}" placeholder="Chapter Title">
         <textarea id="editor-content" style="flex:1;width:100%;background:transparent;border:none;resize:none;font-size:0.85rem;line-height:1.7;padding:4px 0;color:var(--text)" placeholder="Start writing...">${chapter.content}</textarea>
+      </div>
+    </div>
+
+    <!-- Revision History Modal -->
+    <div class="ch-list-modal" id="rev-modal" style="display:none">
+      <div class="ch-list-overlay"></div>
+      <div class="ch-list-panel">
+        <div class="ch-list-header" style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line2)">
+          <span style="font-weight:600;font-size:0.85rem"><img src="Icons/books-stack-of-three.png" width="14" style="vertical-align:middle;margin-right:6px">Revision History</span>
+          <button class="btn btn-sm rd-rev-close" style="font-size:0.65rem">x</button>
+        </div>
+        <div class="ch-list-body" id="rev-list-body" style="overflow-y:auto;max-height:60vh">
+          <p style="font-size:0.65rem;color:var(--text3);padding:16px;text-align:center">Loading...</p>
+        </div>
+        <div id="rev-preview-area" style="display:none;border-top:1px solid var(--line2);padding:12px 16px;max-height:200px;overflow-y:auto">
+          <h4 id="rev-preview-title" style="font-size:0.75rem;font-weight:600;margin-bottom:6px"></h4>
+          <pre id="rev-preview-content" style="font-size:0.65rem;color:var(--text2);white-space:pre-wrap;line-height:1.5"></pre>
+          <button class="btn btn-sm btn-primary rd-rev-restore" id="rev-restore-btn" style="margin-top:8px;font-size:0.65rem">Restore This Version</button>
+        </div>
       </div>
     </div>`;
 }
@@ -1058,7 +1388,7 @@ function renderProfile() {
   if (totalViews >= 100000) achievements.push({ icon: 'Icons/view.png', label: '100K Views' });
   if (totalFlames >= 1) achievements.push({ icon: 'Icons/fire.png', label: 'First Flame' });
   if (totalFlames >= 100) achievements.push({ icon: 'Icons/fire-flame.png', label: '100 Flames' });
-  if (compBooks >= 1) achievements.push({ icon: 'Icons/check-mark.png', label: 'Completed Work' });
+  if (compBooks >= 1) achievements.push({ icon: 'Icons/icons8-check-mark-50.png', label: 'Completed Work' });
 
   // Recently Read - last 3 books with progress
   const recentlyRead = myBooks.filter(b => b.lastReadAt).sort((a, b) => (b.lastReadAt || 0) - (a.lastReadAt || 0)).slice(0, 3);
@@ -1114,7 +1444,7 @@ function renderProfile() {
       <!-- Daily Flames -->
       <div class="prof-rewards prof-rewards">
         <div class="prof-rewards-left">
-          <span class="prof-rewards-icon">+</span>
+          <span class="prof-rewards-icon"><img src="Icons/flames.png" width="22"></span>
           <div>
             <div class="prof-rewards-title">Daily Flames</div>
             <div class="prof-rewards-sub">${rem > 0 ? rem + ' Flame' + (rem > 1 ? 's' : '') + ' available' : 'All used today'}</div>
@@ -1133,7 +1463,7 @@ function renderProfile() {
           <span class="prof-action-label">Edit Profile</span>
         </div>
         <div class="prof-action" id="prof-inbox-toggle" style="cursor:pointer">
-          <div class="prof-action-icon"><span style="font-size:1.2rem;font-weight:700">!</span></div>
+          <div class="prof-action-icon"><img src="Icons/inbox.png" width="22"></div>
           <span class="prof-action-label">Inbox${(state.notifications||[]).length ? ' (' + state.notifications.length + ')' : ''}</span>
         </div>
         <div class="prof-action" onclick="navigate('#/profile/author')">
@@ -1190,7 +1520,7 @@ function renderProfile() {
 
       <!-- FAQ (expandable) -->
       <div class="prof-section prof-section" id="prof-faq-toggle" style="cursor:pointer">
-        <div class="prof-section-icon"><span style="font-size:1.1rem;font-weight:700">?</span></div>
+        <div class="prof-section-icon"><img src="Icons/help.png" width="20"></div>
         <div class="prof-section-body"><span class="prof-section-title">FAQ</span><span class="prof-section-desc">Common questions answered</span></div>
         <span class="prof-section-arrow" id="prof-faq-arrow">+</span>
       </div>
@@ -1204,15 +1534,14 @@ function renderProfile() {
 
       <!-- Theme -->
       <div class="prof-section prof-section" onclick="navigate('#/profile/themes')" style="cursor:pointer">
-        <div class="prof-section-icon"><span style="font-size:1.1rem">*</span></div>
+        <div class="prof-section-icon"><img src="Icons/theme.png" width="20"></div>
         <div class="prof-section-body"><span class="prof-section-title">Theme</span><span class="prof-section-desc">Dark or Galaxy appearance</span></div>
         <span class="prof-section-arrow">-</span>
       </div>
 
       <!-- Services (expandable) -->
       <div class="prof-section prof-section" id="prof-services-toggle" style="cursor:pointer">
-        <div class="prof-section-icon"><span style="font-size:1.1rem;font-weight:700">!</span></div>
-        <div class="prof-section-body"><span class="prof-section-title">Services</span><span class="prof-section-desc">Policies, support, and guidelines</span></div>
+        <div class="prof-section-icon"><img src="Icons/settings.png" width="20"></div><span class="prof-section-desc">Policies, support, and guidelines</span></div>
         <span class="prof-section-arrow" id="prof-services-arrow">+</span>
       </div>
       <div class="prof-services-content" id="prof-services-content" style="display:none">
@@ -1223,13 +1552,16 @@ function renderProfile() {
         <a class="prof-service-item">Community Guidelines</a>
       </div>
 
-      <!-- Logout / Delete -->
+      <!-- Account divider -->
+      <div class="prof-account-divider"></div>
+
+      <!-- Logout -->
       <div class="prof-section" style="cursor:pointer;border-left:2px solid var(--red)" onclick="if(confirm('Sign out?')){document.getElementById('sign-out-btn').click()}">
-        <div class="prof-section-icon"><img src="Icons/icons8-logout-50.png" width="20" style="filter:brightness(0.5)"></div>
+        <div class="prof-section-icon"><img src="Icons/icons8-logout-50.png" width="20" class="prof-icon-dim"></div>
         <div class="prof-section-body"><span class="prof-section-title" style="color:var(--red)">Logout</span><span class="prof-section-desc">Sign out of your account</span></div>
       </div>
       <div class="prof-section" style="cursor:pointer;margin-bottom:24px" onclick="if(confirm('Delete account permanently? This cannot be undone.')){localStorage.clear();location.reload()}">
-        <div class="prof-section-icon"><span style="font-size:1.1rem;color:var(--text3)">-</span></div>
+        <div class="prof-section-icon"><img src="Icons/bin.png" width="20"></div>
         <div class="prof-section-body"><span class="prof-section-title" style="color:var(--text3)">Delete Account</span><span class="prof-section-desc">Permanently remove all data</span></div>
       </div>
     </div>`;
@@ -1474,13 +1806,12 @@ function renderAuthorComments(comments) {
 
 // ---- Themes ----
 function renderThemes() {
-  const darkActive = state.theme !== 'galaxy';
   return `
     <div class="page">
       <a class="back-link" href="#/profile">Back to Profile</a>
       <h1 class="page-title">Theme</h1>
       <div class="theme-grid">
-        <div class="theme-card${darkActive ? ' active' : ''}" data-theme-btn="dark">
+        <div class="theme-card${state.theme === 'dark' ? ' active' : ''}" data-theme-btn="dark">
           <div class="theme-preview theme-preview-dark">
             <div class="theme-preview-header"></div>
             <div class="theme-preview-body">
@@ -1493,9 +1824,9 @@ function renderThemes() {
             <span class="theme-name">Dark</span>
             <span class="theme-desc">Black background, white text</span>
           </div>
-          ${darkActive ? '<span class="theme-check">Selected</span>' : ''}
+          ${state.theme === 'dark' ? '<span class="theme-check">Selected</span>' : ''}
         </div>
-        <div class="theme-card${!darkActive ? ' active' : ''}" data-theme-btn="galaxy">
+        <div class="theme-card${state.theme === 'galaxy' ? ' active' : ''}" data-theme-btn="galaxy">
           <div class="theme-preview theme-preview-galaxy">
             <div class="theme-preview-header"></div>
             <div class="theme-preview-body">
@@ -1508,7 +1839,22 @@ function renderThemes() {
             <span class="theme-name">Galaxy</span>
             <span class="theme-desc">Subtle star field, deep space</span>
           </div>
-          ${!darkActive ? '<span class="theme-check">Selected</span>' : ''}
+          ${state.theme === 'galaxy' ? '<span class="theme-check">Selected</span>' : ''}
+        </div>
+        <div class="theme-card${state.theme === 'white' ? ' active' : ''}" data-theme-btn="white">
+          <div class="theme-preview theme-preview-light">
+            <div class="theme-preview-header"></div>
+            <div class="theme-preview-body">
+              <div class="theme-preview-line"></div>
+              <div class="theme-preview-line short"></div>
+              <div class="theme-preview-block"></div>
+            </div>
+          </div>
+          <div class="theme-info">
+            <span class="theme-name">White</span>
+            <span class="theme-desc">Clean white background, dark text</span>
+          </div>
+          ${state.theme === 'white' ? '<span class="theme-check">Selected</span>' : ''}
         </div>
       </div>
     </div>`;
@@ -1790,6 +2136,30 @@ function renderChapterReader(bookId, chapterId) {
   const ch = chapters.find(c => c.id === chapterId);
   if (!ch) return '<div class="page"><h2>Chapter not found</h2></div>';
 
+  // Save reading progress
+  if (state.loggedIn) {
+    const totalChs = chapters.filter(c => c.published).length || 1;
+    const chIdx = chapters.indexOf(ch);
+    const completion = Math.round(((chIdx + 1) / totalChs) * 100);
+    if (!state.readingProgress) state.readingProgress = [];
+    let prog = state.readingProgress.find(p => p.book_id === bookId);
+    if (prog) {
+      prog.chapter_id = chapterId;
+      prog.completion_pct = completion;
+      prog.last_read_at = new Date().toISOString();
+    } else {
+      state.readingProgress.push({ book_id: bookId, chapter_id: chapterId, completion_pct: completion, last_read_at: new Date().toISOString() });
+    }
+    saveState();
+    syncUpdateProgress(bookId, { chapter_id: chapterId, completion_pct: completion });
+    // Award EXP for reading (once per chapter session)
+    if (!state._readExpCache) state._readExpCache = {};
+    if (!state._readExpCache[chapterId]) {
+      state._readExpCache[chapterId] = true;
+      gainExp(5, 'read');
+    }
+  }
+
   const idx = chapters.indexOf(ch);
   const prevCh = idx > 0 ? chapters[idx - 1] : null;
   const nextCh = idx < chapters.length - 1 ? chapters[idx + 1] : null;
@@ -1798,21 +2168,25 @@ function renderChapterReader(bookId, chapterId) {
   // Flame data
   const td = new Date().toDateString();
   const lv = state.user.level || 1;
-  const maxF = lv >= 5 ? 3 : 2;
-  const used = state.flameDate === td ? state.flamesGiven : 0;
-  const rem = Math.max(0, maxF - used);
+  const maxF = dailyFlameAllowance(lv);
+  const rem = serverOnline ? (state.flamesRemaining ?? maxF) : (state.flameDate === td ? Math.max(0, maxF - state.flamesGiven) : maxF);
   const isAuthor = state.loggedIn && book.author === state.user.username;
+
+  // EXP data
+  const userExp = state.user.exp || 0;
+  const userLvl = state.user.level || 1;
+  const expNeeded = expForLevel(userLvl);
+  const expPct = Math.min(100, Math.round((userExp / expNeeded) * 100));
+  const flameRules = lv >= 21 ? '2/day' : lv >= 11 ? '3/day' : lv >= 5 ? '4/day' : '2/day';
 
   // Comments
   const chComments = getChapterComments(bookId, chapterId);
-  const reactions = getChapterReactions(bookId, chapterId);
-  const userReactions = state.loggedIn ? READER_REACTIONS.filter(r => (reactions[r.id] || []).includes(state.user.username)).map(r => r.id) : [];
 
   return `
     <div class="page reader-page">
       <div class="reader-header">
-        <a class="back-link" href="#/book/${bookId}" style="padding:0">Back to ${book.title}</a>
-        <span class="reader-chapter-info">Ch. ${ch.chapterNumber}</span>
+        <a class="back-link" href="#/book/${bookId}" style="padding:0"><img src="Icons/open-book.png" width="14" style="vertical-align:middle;margin-right:4px">Back to Book</a>
+        <span class="reader-chapter-info">Ch. ${ch.chapterNumber} &middot; ${ch.title}</span>
       </div>
       <h1 class="reader-title">${ch.title}</h1>
       <div class="reader-content">${ch.content}</div>
@@ -1823,40 +2197,37 @@ function renderChapterReader(bookId, chapterId) {
         <!-- Chapter Complete Card -->
         <div class="end-card">
           <div class="end-card-label">Chapter Complete</div>
-          <p class="end-card-sub">Enjoyed this chapter?</p>
+          <p class="end-card-sub">Enjoyed this chapter? Support the author!</p>
         </div>
 
         <!-- Flame Section -->
         ${state.loggedIn && !isAuthor ? `<div class="end-card">
-          <div class="end-card-label">[*] Support Author</div>
-          <div class="end-flame-info">Available Today: ${rem}</div>
-          <button class="btn btn-primary rd-give-flame" data-book="${bookId}" ${rem <= 0 ? 'disabled' : ''} style="${rem <= 0 ? 'opacity:0.4;cursor:default' : ''}">[+] Give Flame</button>
-          <div class="flame-feedback" id="flame-feedback" style="display:none">[+] +1 Flame Sent</div>
+          <div class="end-card-label"><img src="Icons/flames.png" width="16" style="vertical-align:middle;margin-right:6px">Support Author</div>
+          <div class="end-flame-info">Available Today: <strong>${rem}</strong> / ${maxF}</div>
+          <button class="btn btn-primary rd-give-flame" data-book="${bookId}" ${rem <= 0 ? 'disabled' : ''} style="${rem <= 0 ? 'opacity:0.4;cursor:default' : ''}"><img src="Icons/fire.png" width="14" style="vertical-align:middle;margin-right:4px">Give Flame</button>
+          <div class="flame-feedback" id="flame-feedback" style="display:none"><img src="Icons/fire-flame.png" width="14" style="vertical-align:middle;margin-right:4px">+1 Flame Sent</div>
           <div class="end-flame-rules">
             <span>Lv 1-4: 2/day</span>
             <span>Lv 5-10: 3/day</span>
+            <span>Lv 11-20: 4/day</span>
+            <span>Lv 21+: 5/day</span>
           </div>
         </div>` : ''}
 
-        <!-- Reader Reactions -->
-        <div class="end-card">
-          <div class="end-card-label">Reader Reactions</div>
-          <div class="react-grid">
-            ${READER_REACTIONS.map(r => {
-              const count = (reactions[r.id] || []).length;
-              const active = userReactions.includes(r.id);
-              const canReact = state.loggedIn && !isAuthor;
-              return `<button class="react-btn${active ? ' active' : ''}" data-react="${r.id}" data-book="${bookId}" data-chapter="${chapterId}" ${!canReact ? 'disabled' : ''} style="${!canReact ? 'opacity:0.4;cursor:default' : ''}">
-                <span>${r.label}</span>
-                ${count > 0 ? `<span class="react-count">${count}</span>` : ''}
-              </button>`;
-            }).join('')}
+        <!-- EXP Bar -->
+        ${state.loggedIn ? `<div class="end-card">
+          <div class="end-exp-header">
+            <span class="end-exp-level">Level ${userLvl}</span>
+            <span class="end-exp-numbers">${userExp} / ${expNeeded} EXP</span>
           </div>
-        </div>
+          <div class="end-exp-bar">
+            <div class="end-exp-fill" style="width:${expPct}%"></div>
+          </div>
+        </div>` : ''}
 
         <!-- Comments Section -->
         <div class="end-card">
-          <div class="end-card-label">[+] Chapter Discussion</div>
+          <div class="end-card-label"><img src="Icons/inbox.png" width="14" style="vertical-align:middle;margin-right:6px">Chapter Discussion</div>
           ${state.loggedIn ? `
           <form class="ch-comment-form" data-book="${bookId}" data-chapter="${chapterId}" style="margin-bottom:10px">
             <textarea class="input-field" name="content" placeholder="Comment on this chapter..." rows="2" style="margin-bottom:6px"></textarea>
@@ -1879,9 +2250,9 @@ function renderChapterReader(bookId, chapterId) {
 
         <!-- Navigation -->
         <div class="end-nav">
-          ${prevCh ? `<a class="btn btn-sm" href="#/book/${bookId}/read/${prevCh.id}">[<] Previous</a>` : '<span></span>'}
-          <button class="btn btn-sm rd-chapter-list" data-book="${bookId}">[=] Chapters</button>
-          ${nextCh ? `<a class="btn btn-primary" href="#/book/${bookId}/read/${nextCh.id}">Next [>]</a>` : `<a class="btn btn-sm" href="#/book/${bookId}">Back To Book</a>`}
+          ${prevCh ? `<a class="btn btn-sm" href="#/book/${bookId}/read/${prevCh.id}"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Previous</a>` : '<span></span>'}
+          <button class="btn btn-sm rd-chapter-list" data-book="${bookId}"><img src="Icons/books-stack-of-three.png" width="12" style="vertical-align:middle;margin-right:4px">Chapters</button>
+          ${nextCh ? `<a class="btn btn-primary" href="#/book/${bookId}/read/${nextCh.id}">Next <img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-left:4px"></a>` : `<a class="btn btn-sm" href="#/book/${bookId}"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back to Book</a>`}
         </div>
 
       </div>
@@ -2047,7 +2418,122 @@ function bindPageEvents(route) {
       const title = document.getElementById('editor-title')?.value || '';
       const content = document.getElementById('editor-content')?.value || '';
       updateChapter(el.dataset.book, el.dataset.ch, { title, content });
-      alert('Saved');
+      const status = document.getElementById('editor-autosave-status');
+      if (status) { status.textContent = 'Saved'; setTimeout(() => { status.textContent = ''; }, 2000); }
+    });
+  });
+
+  // ---- Editor autosave ----
+  const editorTitle = document.getElementById('editor-title');
+  const editorContent = document.getElementById('editor-content');
+  let autoSaveTimer = null;
+  function doAutoSave() {
+    const bookId = document.querySelector('.ed-save')?.dataset?.book;
+    const chId = document.querySelector('.ed-save')?.dataset?.ch;
+    if (!bookId || !chId) return;
+    const title = editorTitle?.value || '';
+    const content = editorContent?.value || '';
+    updateChapter(bookId, chId, { title, content });
+    const status = document.getElementById('editor-autosave-status');
+    if (status) { status.textContent = 'Auto-saved'; setTimeout(() => { status.textContent = 'Draft saved'; }, 2000); }
+  }
+  if (editorTitle && editorContent) {
+    [editorTitle, editorContent].forEach(el => {
+      el.addEventListener('input', () => {
+        const status = document.getElementById('editor-autosave-status');
+        if (status) status.textContent = 'Unsaved changes';
+        clearTimeout(autoSaveTimer);
+        autoSaveTimer = setTimeout(doAutoSave, 30000);
+      });
+    });
+  }
+
+  // ---- Editor revisions ----
+  document.querySelectorAll('.ed-revisions').forEach(el => {
+    el.addEventListener('click', async () => {
+      const chId = el.dataset.ch;
+      const modal = document.getElementById('rev-modal');
+      const body = document.getElementById('rev-list-body');
+      const preview = document.getElementById('rev-preview-area');
+      if (!modal || !body) return;
+      modal.style.display = 'block';
+      preview.style.display = 'none';
+      body.innerHTML = '<p style="font-size:0.65rem;color:var(--text3);padding:16px;text-align:center">Loading...</p>';
+
+      let revisions = [];
+      if (serverOnline) {
+        const res = await syncGetRevisions(chId);
+        if (res) revisions = res;
+      }
+      if (!revisions.length) {
+        body.innerHTML = '<p style="font-size:0.65rem;color:var(--text3);padding:16px;text-align:center">No revision history available</p>';
+        return;
+      }
+      body.innerHTML = revisions.map(r => `
+        <div class="rev-item" style="display:flex;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line2);cursor:pointer;transition:0.1s"
+             data-rev-id="${r.id}" data-ch-id="${chId}">
+          <div style="flex:1">
+            <div style="font-size:0.75rem;font-weight:600">Version ${r.version}</div>
+            <div style="font-size:0.6rem;color:var(--text3)">${new Date(r.created_at).toLocaleString()}</div>
+          </div>
+          <button class="btn btn-sm rev-preview-btn" data-rev-id="${r.id}" data-ch-id="${chId}" style="font-size:0.55rem;padding:3px 8px">Preview</button>
+        </div>
+      `).join('');
+    });
+  });
+
+  // ---- Revision preview ----
+  document.addEventListener('click', e => {
+    const btn = e.target.closest('.rev-preview-btn');
+    if (!btn) return;
+    const revId = btn.dataset.revId;
+    const chId = btn.dataset.chId;
+    const previewArea = document.getElementById('rev-preview-area');
+    const previewTitle = document.getElementById('rev-preview-title');
+    const previewContent = document.getElementById('rev-preview-content');
+    const restoreBtn = document.getElementById('rev-restore-btn');
+    if (!previewArea) return;
+    previewArea.style.display = 'block';
+
+    if (serverOnline) {
+      syncGetRevision(chId, revId).then(rev => {
+        if (rev) {
+          previewTitle.textContent = rev.title || 'Untitled';
+          previewContent.textContent = (rev.content || '').slice(0, 500) + ((rev.content || '').length > 500 ? '...' : '');
+          restoreBtn.dataset.revId = revId;
+          restoreBtn.dataset.chId = chId;
+        }
+      });
+    }
+  });
+
+  // ---- Revision restore ----
+  document.addEventListener('click', e => {
+    const btn = e.target.closest('.rd-rev-restore');
+    if (!btn) return;
+    const revId = btn.dataset.revId;
+    const chId = btn.dataset.chId;
+    if (!confirm('Restore this version? Current changes will be saved as a new revision.')) return;
+    if (serverOnline) {
+      syncRestoreRevision(chId, revId).then(chapter => {
+        if (chapter) {
+          document.getElementById('editor-title').value = chapter.title;
+          document.getElementById('editor-content').value = chapter.content;
+          const modal = document.getElementById('rev-modal');
+          if (modal) modal.style.display = 'none';
+          const status = document.getElementById('editor-autosave-status');
+          if (status) status.textContent = 'Version restored';
+          updateChapter(document.querySelector('.ed-save')?.dataset?.book, chId, { title: chapter.title, content: chapter.content });
+        }
+      });
+    }
+  });
+
+  // ---- Revision modal close ----
+  document.querySelectorAll('.rd-rev-close, .ch-list-overlay').forEach(el => {
+    el.addEventListener('click', () => {
+      const modal = document.getElementById('rev-modal');
+      if (modal) modal.style.display = 'none';
     });
   });
 
@@ -2124,47 +2610,14 @@ function bindPageEvents(route) {
     });
   }
 
-  // ---- Settings cover toggle ----
-  const settingsCoverToggle = document.getElementById('settings-cover-toggle');
-  if (settingsCoverToggle) {
-    settingsCoverToggle.addEventListener('click', () => {
-      const content = document.getElementById('settings-cover-content');
-      const arrow = document.getElementById('settings-cover-arrow');
-      if (content) content.style.display = content.style.display === 'none' ? 'block' : 'none';
-      if (arrow) arrow.textContent = arrow.textContent === '+' ? '-' : '+';
-    });
-  }
-
-  // ---- Settings publishing toggle ----
-  const settingsPubToggle = document.getElementById('settings-pub-toggle');
-  if (settingsPubToggle) {
-    settingsPubToggle.addEventListener('click', () => {
-      const content = document.getElementById('settings-pub-content');
-      const arrow = document.getElementById('settings-pub-arrow');
-      if (content) content.style.display = content.style.display === 'none' ? 'block' : 'none';
-      if (arrow) arrow.textContent = arrow.textContent === '+' ? '-' : '+';
-    });
-  }
-
   // ---- Settings publish/unpublish ----
   const settingsPublishBtn = document.getElementById('settings-publish-btn');
   if (settingsPublishBtn) {
-    settingsPublishBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
+    settingsPublishBtn.addEventListener('click', () => {
       const book = getBook(settingsPublishBtn.dataset.book);
-      if (book) {
-        updateBook(settingsPublishBtn.dataset.book, { status: book.status === 'Draft' ? 'Ongoing' : 'Draft' });
-        render();
-      }
-    });
-  }
-
-  // ---- Settings unpublish from danger card ----
-  const settingsUnpublishBtn = document.getElementById('settings-unpublish-btn');
-  if (settingsUnpublishBtn) {
-    settingsUnpublishBtn.addEventListener('click', () => {
-      if (!confirm('Unpublish this book? It will be hidden from public.')) return;
-      updateBook(settingsUnpublishBtn.dataset.book, { status: 'Draft' });
+      if (!book) return;
+      if (book.status !== 'Draft' && !confirm('Unpublish this book? It will be hidden from public.')) return;
+      updateBook(settingsPublishBtn.dataset.book, { status: book.status === 'Draft' ? 'Ongoing' : 'Draft' });
       render();
     });
   }
@@ -2176,6 +2629,23 @@ function bindPageEvents(route) {
       if (!confirm('Delete this book permanently? This cannot be undone.')) return;
       deleteBook(settingsDeleteBtn.dataset.book);
       navigate('#/');
+    });
+  }
+
+  // ---- Settings save details ----
+  const settingsSaveBtn = document.getElementById('settings-details-save');
+  if (settingsSaveBtn) {
+    settingsSaveBtn.addEventListener('click', () => {
+      const id = settingsSaveBtn.dataset.book;
+      const title = document.getElementById('settings-details-title').value.trim();
+      const synopsis = document.getElementById('settings-details-synopsis').value.trim();
+      const genre = document.getElementById('settings-details-genre').value;
+      const type = document.getElementById('settings-details-type').value;
+      const status = document.getElementById('settings-details-status').value;
+      const tagsRaw = document.getElementById('settings-details-tags').value;
+      const tags = tagsRaw.split(',').map(t => t.trim()).filter(Boolean);
+      updateBook(id, { title, synopsis, genre, type, status, tags });
+      render();
     });
   }
 
@@ -2541,24 +3011,36 @@ function bindPageEvents(route) {
     el.addEventListener('click', function() {
       const bookId = this.dataset.book;
       const fb = document.getElementById('flame-feedback');
-      if (giveSingleFlame(bookId)) {
-        saveState();
-        if (fb) {
-          fb.style.display = 'block';
-          fb.classList.add('flame-anim');
-          setTimeout(() => { fb.classList.remove('flame-anim'); render(); }, 1200);
-        } else { render(); }
+      if (serverOnline) {
+        const chs = state.chapters[bookId];
+        const chId = chs && chs.length ? chs[chs.length-1].id : null;
+        const promise = chId ? syncGiveSingleFlame(chId) : syncGiveFlame(bookId);
+        promise.then(res => {
+          if (res) {
+            const book = getBook(bookId);
+            if (book) book.flames = res.bookFlames;
+            state.flamesRemaining = res.remaining;
+            const gained = res.expGained || 10;
+            gainExp(gained, 'flame').then(() => render());
+            saveState();
+            if (fb) {
+              fb.style.display = 'block';
+              fb.classList.add('flame-anim');
+              setTimeout(() => { fb.classList.remove('flame-anim'); render(); }, 1200);
+            } else { render(); }
+          }
+        });
+      } else {
+        if (giveSingleFlame(bookId)) {
+          saveState();
+          gainExp(10, 'flame');
+          if (fb) {
+            fb.style.display = 'block';
+            fb.classList.add('flame-anim');
+            setTimeout(() => { fb.classList.remove('flame-anim'); render(); }, 1200);
+          } else { render(); }
+        }
       }
-    });
-  });
-
-  // ---- Reader: Toggle Reaction ----
-  document.querySelectorAll('.react-btn').forEach(el => {
-    el.addEventListener('click', function() {
-      const bookId = this.dataset.book;
-      const chapterId = this.dataset.chapter;
-      toggleChapterReaction(bookId, chapterId, this.dataset.react);
-      render();
     });
   });
 
