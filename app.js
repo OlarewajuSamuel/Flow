@@ -107,8 +107,14 @@ async function initAuth() {
 // ── Server data sync ────────────────────────────
 async function loadServerData() {
   if (!serverOnline) return;
-  // Load books
-  const books = await apiFetch('/api/books');
+  // Load public books plus the signed-in author's private workspace books.
+  const publicBooks = await apiFetch('/api/books');
+  const ownBooks = state.user.id ? await apiFetch(`/api/books?author_id=${state.user.id}`) : [];
+  const mergedBooks = [...(publicBooks || []), ...(ownBooks || [])].reduce((map, book) => {
+    map.set(book.id, normalizeServerBook(book));
+    return map;
+  }, new Map());
+  const books = [...mergedBooks.values()];
   if (books && Array.isArray(books)) {
     state.books = books;
     // Load chapters for each book
@@ -116,13 +122,16 @@ async function loadServerData() {
       const chapters = await apiFetch(`/api/books/${book.id}/chapters`);
       if (chapters && Array.isArray(chapters)) state.chapters[book.id] = chapters;
       const chars = await apiFetch(`/api/books/${book.id}/characters`);
-      if (chars && Array.isArray(chars)) state.characters[book.id] = chars;
+      if (chars && Array.isArray(chars)) state.characters[book.id] = chars.map(c => ({ ...c, image: c.image || c.portrait || '', description: c.description || c.biography || '' }));
       // Load reviews
       const reviews = await apiFetch(`/api/books/${book.id}/reviews`);
       if (reviews && Array.isArray(reviews)) state.reviews[book.id] = reviews;
       // Load flames
       const f = await apiFetch(`/api/books/${book.id}/flames`);
-      if (f) book.serverFlames = f.total;
+      if (f) {
+        book.serverFlames = f.total;
+        book.flames = f.total;
+      }
     }
   }
   // Load user profile
@@ -172,16 +181,33 @@ async function apiSync(method, path, body) {
 }
 
 async function syncCreateBook(book) {
+  const localId = book.id;
   const res = await apiSync('POST', '/api/books', {
     title: book.title, synopsis: book.synopsis, genre: book.genre,
     type: book.type, tags: book.tags, cover: book.cover,
     status: book.status, visibility: 'public'
   });
-  if (res) book.serverId = res.id;
+  if (res) {
+    const normalized = normalizeServerBook(res);
+    Object.assign(book, normalized);
+    if (localId !== book.id) {
+      state.chapters[book.id] = state.chapters[localId] || [];
+      state.characters[book.id] = state.characters[localId] || [];
+      delete state.chapters[localId];
+      delete state.characters[localId];
+    }
+    saveState();
+    render();
+  }
 }
 
 async function syncUpdateBook(id, data) {
-  await apiSync('PUT', `/api/books/${id}`, data);
+  const res = await apiSync('PUT', `/api/books/${id}`, data);
+  if (res) {
+    const book = getBook(id);
+    if (book) Object.assign(book, normalizeServerBook(res));
+    saveState();
+  }
 }
 
 async function syncDeleteBook(id) {
@@ -194,10 +220,22 @@ async function syncPublishBook(id) {
 }
 
 async function syncCreateChapter(bookId, chapter) {
+  const localId = chapter.id;
   const res = await apiSync('POST', `/api/books/${bookId}/chapters`, {
     title: chapter.title, content: chapter.content, published: chapter.published
   });
-  if (res) chapter.serverId = res.id;
+  if (res) {
+    Object.assign(chapter, res);
+    if (localId !== chapter.id) {
+      const key = bookId + '_' + localId;
+      const nextKey = bookId + '_' + chapter.id;
+      if (state.chapterComments[key]) {
+        state.chapterComments[nextKey] = state.chapterComments[key];
+        delete state.chapterComments[key];
+      }
+    }
+    saveState();
+  }
 }
 
 async function syncUpdateChapter(chapterId, data) {
@@ -212,7 +250,10 @@ async function syncCreateCharacter(bookId, char) {
   const res = await apiSync('POST', `/api/books/${bookId}/characters`, {
     name: char.name, biography: char.description, portrait: char.image
   });
-  if (res) char.serverId = res.id;
+  if (res) {
+    Object.assign(char, { ...res, image: res.portrait || char.image, description: res.biography || char.description });
+    saveState();
+  }
 }
 
 async function syncDeleteCharacter(charId) {
@@ -330,19 +371,24 @@ async function syncUpdateSettings(data) {
 function expForLevel(lvl) { return lvl * 100; }
 function dailyFlameAllowance(lvl) { return lvl >= 21 ? 5 : lvl >= 11 ? 4 : lvl >= 5 ? 3 : 2; }
 
+function applyExpReward(reward) {
+  if (!reward) return;
+  state.user.level = reward.level;
+  state.user.exp = reward.exp;
+  if (reward.lifetime != null) state.user.lifetime_exp = reward.lifetime;
+  else if (reward.awarded) state.user.lifetime_exp = (state.user.lifetime_exp || 0) + (reward.amount || 0);
+  if (reward.leveledUp) {
+    state.flameAllowance = dailyFlameAllowance(reward.level);
+    showToast(`Level Up! You are now level ${reward.level}`);
+  }
+  saveState();
+}
+
 async function gainExp(amount, reason) {
   if (serverOnline) {
     const res = await syncAwardExp(amount, reason);
     if (res) {
-      state.user.level = res.level;
-      state.user.exp = res.exp;
-      state.user.lifetime_exp = (state.user.lifetime_exp || 0) + amount;
-      if (res.leveledUp) {
-        state.user.flameAllowance = dailyFlameAllowance(res.level);
-        state.user.flamesRemaining = state.user.flameAllowance;
-        showToast(`Level Up! You are now level ${res.level}`);
-      }
-      saveState();
+      applyExpReward(res);
       return res;
     }
   }
@@ -387,6 +433,43 @@ function fmt(n) { if (n >= 1e6) return (n/1e6).toFixed(1)+'M'; if (n >= 1e3) ret
 function coverColor(title) {
   const colors = ['#1a1a1a,#000000','#2a2a2a,#0a0a0a','#222222,#000000','#333333,#111111','#1a1a1a,#0a0a0a','#2a2a2a,#000000','#111111,#000000','#252525,#050505','#1e1e1e,#000000','#2e2e2e,#080808'];
   let h = 0; for (let i = 0; i < title.length; i++) h = title.charCodeAt(i) + ((h << 5) - h); return colors[Math.abs(h) % colors.length];
+}
+function cssUrl(url) { return String(url || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\)/g, '\\)'); }
+function imageBg(url, fallback) { return url ? `background-image:url('${cssUrl(url)}')` : fallback; }
+function imageClass(base, url) { return `${base}${url ? ' has-img' : ''}`; }
+function coverClass(base, url) { return `${base}${url ? ' has-cover' : ''}`; }
+function imageFallback(text) { return (text || '?').trim().slice(0, 1).toUpperCase() || '?'; }
+function bindImageErrorLogging() {
+  document.querySelectorAll('[data-img-url]').forEach(el => {
+    const url = el.dataset.imgUrl;
+    if (!url || el.dataset.imgChecked) return;
+    el.dataset.imgChecked = '1';
+    const img = new Image();
+    img.onload = () => {};
+    img.onerror = () => {
+      console.warn('Broken image URL detected', { url, context: el.dataset.imgContext || el.className });
+      el.classList.add('img-broken');
+      el.style.backgroundImage = '';
+    };
+    img.src = url;
+  });
+}
+function normalizeServerBook(book) {
+  const status = book.status || (book.published ? 'Ongoing' : 'Draft');
+  return {
+    ...book,
+    author: book.author || book.username || state.user.username,
+    type: book.type || 'Novel',
+    status,
+    published: !!book.published || status !== 'Draft',
+    flames: book.flames ?? book.serverFlames ?? 0,
+    favorites: book.favorites || 0,
+    createdAt: book.createdAt || (book.created_at ? book.created_at.slice(0, 10) : today()),
+    updatedAt: book.updatedAt || (book.updated_at ? book.updated_at.slice(0, 10) : today()),
+  };
+}
+function isPublicBook(book) {
+  return !!book && book.status !== 'Draft' && book.published !== false && (book.visibility || 'public') === 'public';
 }
 function getBook(id) { return state.books.find(b => b.id === id); }
 function getBooksByAuthor() { return state.books.filter(b => b.author === state.user.username); }
@@ -527,9 +610,9 @@ function giveFlames(bookId) {
       if (res) {
         state.flamesRemaining = res.remaining;
         book.flames = res.bookFlames;
-        if (res.expGained) gainExp(res.expGained, 'flame');
+        if (res.expReward) applyExpReward(res.expReward);
         saveState();
-        renderApp();
+        render();
       }
     });
     return true;
@@ -576,8 +659,17 @@ function createReview(bookId, data) {
   reviews.push(r);
   state.reviews[bookId] = reviews;
   saveState();
-  gainExp(20, 'review');
-  syncCreateReview(bookId, data);
+  if (serverOnline) {
+    syncCreateReview(bookId, data).then(res => {
+      if (!res) return;
+      Object.assign(r, res);
+      if (res.expReward) applyExpReward(res.expReward);
+      saveState();
+      render();
+    });
+  } else {
+    gainExp(20, 'review');
+  }
   return r;
 }
 
@@ -637,8 +729,17 @@ function createChapterComment(bookId, chapterId, content) {
   const c = { id: genId(), username: state.user.username, content, createdAt: new Date().toLocaleDateString() };
   state.chapterComments[key].push(c);
   saveState();
-  gainExp(10, 'comment');
-  syncCreateComment(chapterId, content);
+  if (serverOnline) {
+    syncCreateComment(chapterId, content).then(res => {
+      if (!res) return;
+      Object.assign(c, res);
+      if (res.expReward) applyExpReward(res.expReward);
+      saveState();
+      render();
+    });
+  } else {
+    gainExp(10, 'comment');
+  }
   return c;
 }
 function deleteChapterComment(bookId, chapterId, commentId) {
@@ -656,6 +757,14 @@ function giveSingleFlame(bookId) {
     const ch = state.chapters[bookId];
     const chId = ch && ch.length ? ch[ch.length-1].id : '';
     const endpoint = chId ? syncGiveSingleFlame(chId) : syncGiveFlame(bookId);
+    endpoint.then(res => {
+      if (!res) return;
+      state.flamesRemaining = res.remaining;
+      book.flames = res.bookFlames;
+      if (res.expReward) applyExpReward(res.expReward);
+      saveState();
+      render();
+    });
     return true;
   }
 
@@ -747,6 +856,7 @@ function render() {
   });
 
   bindPageEvents(route);
+  bindImageErrorLogging();
 
   document.documentElement.setAttribute('data-theme', state.theme);
 
@@ -785,7 +895,7 @@ function render() {
 
 // ---- Featured ----
 function renderFeatured() {
-  const books = state.books;
+  const books = state.books.filter(isPublicBook);
   const powerRank = [...books].sort((a,b) => b.flames - a.flames).slice(0, 10);
   const collRank = [...books].sort((a,b) => b.favorites - a.favorites).slice(0, 10);
 
@@ -831,7 +941,7 @@ function renderFeatured() {
 function bookCard(n) {
   const badge = n.status === 'Draft' ? '' : n.status === 'Completed' ? '<span class="badge badge-complete">DONE</span>' : '';
   return `<a class="book-card" href="#/book/${n.id}">
-    <div class="book-cover" style="background:linear-gradient(135deg,${coverColor(n.title)})">${badge}<span>${n.title[0]}</span></div>
+    <div class="${coverClass('book-cover', n.cover)}" data-img-url="${n.cover || ''}" data-img-context="book-cover:${n.id}" style="${imageBg(n.cover, 'background:linear-gradient(135deg,' + coverColor(n.title) + ')')}">${badge}<span>${n.cover ? '' : imageFallback(n.title)}</span></div>
     <div class="book-info"><div class="book-title">${n.title}</div><span class="book-author">${n.author}</span><div class="book-stats"><span>${fmt(n.flames)}</span></div></div>
   </a>`;
 }
@@ -840,7 +950,7 @@ function rankingItem(n, i) {
   const cls = i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : '';
   return `<a class="ranking-item" href="#/book/${n.id}">
     <span class="ranking-pos ${cls}">${i + 1}</span>
-    <div class="ranking-cover" style="background:linear-gradient(135deg,${coverColor(n.title)})">${n.title[0]}</div>
+    <div class="${coverClass('ranking-cover', n.cover)}" data-img-url="${n.cover || ''}" data-img-context="ranking-cover:${n.id}" style="${imageBg(n.cover, 'background:linear-gradient(135deg,' + coverColor(n.title) + ')')}">${n.cover ? '' : imageFallback(n.title)}</div>
     <div class="ranking-info"><h4>${n.title}</h4><span class="ranking-author">${n.author}</span><span class="ranking-meta">${fmt(n.flames)}</span></div>
   </a>`;
 }
@@ -848,7 +958,7 @@ function rankingItem(n, i) {
 // ---- Library ----
 function renderLibrary() {
   const favs = state.favorites;
-  const favBooks = state.books.filter(b => favs.includes(b.id));
+  const favBooks = state.books.filter(b => favs.includes(b.id) && isPublicBook(b));
   return `
     <div class="page library-page">
       <h1 class="page-title">Library</h1>
@@ -863,7 +973,7 @@ function renderLibrary() {
 
 function hBookCard(n) {
   return `<a class="book-card-h" href="#/book/${n.id}">
-    <div class="book-cov-m" style="background:linear-gradient(135deg,${coverColor(n.title)})">${n.title[0]}</div>
+    <div class="${coverClass('book-cov-m', n.cover)}" data-img-url="${n.cover || ''}" data-img-context="book-cover-small:${n.id}" style="${imageBg(n.cover, 'background:linear-gradient(135deg,' + coverColor(n.title) + ')')}">${n.cover ? '' : imageFallback(n.title)}</div>
     <div class="ranking-info"><h4>${n.title}</h4><span class="ranking-author">${n.author}</span><span class="ranking-meta">${fmt(n.flames)}</span></div>
   </a>`;
 }
@@ -873,7 +983,7 @@ function writeBookCard(w) {
   const badgeClr = w.status === 'Draft' ? 'var(--text3)' : w.status === 'Completed' ? 'var(--accent)' : 'var(--text2)';
   const badgeBg = w.status === 'Draft' ? 'var(--accent-subtle)' : 'rgba(255,255,255,0.08)';
   return `<a class="book-card-h" href="#/write/works/${w.id}">
-    <div class="book-cov-m" style="background:linear-gradient(135deg,${coverColor(w.title)})">${w.title[0]}</div>
+    <div class="${coverClass('book-cov-m', w.cover)}" data-img-url="${w.cover || ''}" data-img-context="workspace-cover:${w.id}" style="${imageBg(w.cover, 'background:linear-gradient(135deg,' + coverColor(w.title) + ')')}">${w.cover ? '' : imageFallback(w.title)}</div>
     <div class="ranking-info">
       <h4>${w.title}</h4>
       <span class="ranking-author">${w.author}</span>
@@ -998,7 +1108,7 @@ function renderWorkspaceBook(id) {
 
       <!-- Book Header -->
       <div class="book-settings-header" style="margin-bottom:14px">
-        <div class="work-cover has-cover" style="width:56px;height:76px;background:${coverImg ? 'url(' + coverImg + ') center/cover' : 'linear-gradient(135deg,' + coverColor(book.title) + ')'}">${coverImg ? '' : book.title.slice(0,2)}</div>
+        <div class="${coverClass('work-cover', coverImg)}" data-img-url="${coverImg}" data-img-context="workspace-detail-cover:${id}" style="width:56px;height:76px;${imageBg(coverImg, 'background:linear-gradient(135deg,' + coverColor(book.title) + ')')}">${coverImg ? '' : book.title.slice(0,2)}</div>
         <div class="book-settings-meta">
           <div class="book-settings-title">${book.title}</div>
           <span class="book-settings-genre">${book.genre || 'Uncategorized'} | ${book.type}</span>
@@ -1191,7 +1301,7 @@ function renderWorkspaceBook(id) {
           <div class="content-section" style="margin-bottom:12px">
             <h3 class="section-title" style="margin-bottom:12px">Media</h3>
             <div class="settings-cover-area">
-              <div class="book-settings-cover${coverImg ? ' has-cover' : ''}" style="width:80px;height:110px;margin:0 auto;background-size:cover;background-position:center;${coverImg ? 'background-image:url(' + coverImg + ')' : ''}">${coverImg ? '' : book.title[0]}</div>
+              <div class="${coverClass('book-settings-cover', coverImg)}" data-img-url="${coverImg}" data-img-context="settings-cover:${id}" style="width:80px;height:110px;margin:0 auto;${imageBg(coverImg, '')}">${coverImg ? '' : imageFallback(book.title)}</div>
               <input type="file" id="settings-cover-input" accept="image/*" style="display:none">
               <div class="settings-media-actions">
                 <label for="settings-cover-input" class="btn btn-sm" style="margin-top:8px;display:inline-block">${coverImg ? 'Replace Cover' : 'Upload Cover'}</label>
@@ -1326,7 +1436,7 @@ function renderEditor(bookId, chapterId) {
 // ---- Explore ----
 let expGenre = null, expRankTab = 'Popular';
 function renderExplore(type) {
-  const books = state.books.filter(b => b.type === type && b.status !== 'Draft');
+  const books = state.books.filter(b => b.type === type && isPublicBook(b));
   const filtered = expGenre ? books.filter(b => b.genre === expGenre) : books;
   const rankTabs = ['Popular','New'];
   const sorted = [...books].sort((a,b) => expRankTab === 'New' ? new Date(b.createdAt) - new Date(a.createdAt) : b.flames - a.flames).slice(0, 30);
@@ -1397,14 +1507,13 @@ function renderProfile() {
   const today = new Date().toDateString();
   const dailyStreak = state.dailyStreak || 0;
   const flameLv = u.level || 1;
-  const maxFlames = flameLv >= 5 ? 3 : 2;
-  const used = state.flameDate === today ? state.flamesGiven : 0;
-  const rem = Math.max(0, maxFlames - used);
+  const maxFlames = dailyFlameAllowance(flameLv);
+  const rem = serverOnline ? (state.flamesRemaining ?? maxFlames) : Math.max(0, maxFlames - (state.flameDate === today ? state.flamesGiven : 0));
 
   return `
     <div class="page profile-page">
       <!-- Banner -->
-      <div class="prof-banner${bannerImg ? ' has-bg' : ''}" style="${bannerImg ? 'background-image:url(' + bannerImg + ')' : ''}">
+      <div class="prof-banner${bannerImg ? ' has-bg' : ''}" data-img-url="${bannerImg}" data-img-context="profile-banner" style="${imageBg(bannerImg, '')}">
         <div class="prof-banner-actions">
           <button class="btn btn-sm banner-btn" onclick="document.getElementById('banner-input').click()">Change Banner</button>
           <input type="file" id="banner-input" accept="image/*" style="display:none">
@@ -1414,7 +1523,7 @@ function renderProfile() {
       <!-- Avatar + Name + Level + EXP -->
       <div class="prof-header-main">
         <div class="prof-avatar-wrap">
-          <div class="prof-avatar${avatarImg ? ' has-img' : ''}" style="${avatarImg ? 'background-image:url(' + avatarImg + ')' : ''}">${avatarImg ? '' : u.username[0]}</div>
+          <div class="${imageClass('prof-avatar', avatarImg)}" data-img-url="${avatarImg}" data-img-context="profile-avatar" style="${imageBg(avatarImg, '')}">${avatarImg ? '' : imageFallback(u.username)}</div>
           <button class="prof-avatar-edit" onclick="document.getElementById('avatar-input').click()"></button>
           <input type="file" id="avatar-input" accept="image/*" style="display:none">
         </div>
@@ -1580,7 +1689,7 @@ function renderEditProfile() {
           <div class="edit-img-row">
             <div class="edit-img-group">
               <label>Avatar</label>
-              <div class="edit-avatar-preview" id="edit-avatar-preview" style="background-image:${u.avatar ? 'url(' + u.avatar + ')' : 'none'}">${u.avatar ? '' : u.username[0]}</div>
+              <div class="edit-avatar-preview" id="edit-avatar-preview" data-img-url="${u.avatar || ''}" data-img-context="edit-avatar" style="${imageBg(u.avatar, '')}">${u.avatar ? '' : imageFallback(u.username)}</div>
               <div class="edit-img-actions">
                 <button type="button" class="btn btn-sm" onclick="document.getElementById('edit-avatar-input').click()">Upload</button>
                 <button type="button" class="btn btn-sm" id="remove-avatar-btn" style="${u.avatar ? '' : 'display:none'}">Remove</button>
@@ -1589,7 +1698,7 @@ function renderEditProfile() {
             </div>
             <div class="edit-img-group">
               <label>Banner</label>
-              <div class="edit-banner-preview" id="edit-banner-preview" style="background-image:${u.banner ? 'url(' + u.banner + ')' : 'none'}"></div>
+              <div class="edit-banner-preview" id="edit-banner-preview" data-img-url="${u.banner || ''}" data-img-context="edit-banner" style="${imageBg(u.banner, '')}"></div>
               <div class="edit-img-actions">
                 <button type="button" class="btn btn-sm" onclick="document.getElementById('edit-banner-input').click()">Upload</button>
                 <button type="button" class="btn btn-sm" id="remove-banner-btn" style="${u.banner ? '' : 'display:none'}">Remove</button>
@@ -1647,10 +1756,10 @@ function renderAuthorProfile() {
   return `
     <div class="page author-profile">
       <div class="author-header">
-        <div class="author-banner" style="${bannerImg ? 'background-image:url(' + bannerImg + ')' : ''}"></div>
+        <div class="author-banner" data-img-url="${bannerImg}" data-img-context="author-banner" style="${imageBg(bannerImg, '')}"></div>
         <div class="author-header-content">
           <div class="author-info-row">
-            <div class="author-avatar${avatarImg?' has-img':''}" style="${avatarImg ? 'background-image:url(' + avatarImg + ')' : ''}">${avatarImg ? '' : u.username[0]}</div>
+            <div class="${imageClass('author-avatar', avatarImg)}" data-img-url="${avatarImg}" data-img-context="author-avatar" style="${imageBg(avatarImg, '')}">${avatarImg ? '' : imageFallback(u.username)}</div>
             <div class="author-header-text">
               <h1 class="author-name">${u.username}</h1>
               <div class="author-badges-row">
@@ -1935,6 +2044,8 @@ let bookTab = 'Overview';
 function renderBookPage(id) {
   const book = getBook(id);
   if (!book) return '<div class="page"><h2>Book not found</h2></div>';
+  const isAuthor = state.loggedIn && book.author === state.user.username;
+  if (!isAuthor && !isPublicBook(book)) return '<div class="page"><h2>Book not found</h2></div>';
 
   recordView(id);
   const chapters = (state.chapters[id] || []).filter(c => c.published);
@@ -1942,7 +2053,6 @@ function renderBookPage(id) {
   const isFav = state.favorites.includes(id);
   const coverImg = book.cover || '';
   const reviews = getReviews(id);
-  const isAuthor = state.loggedIn && book.author === state.user.username;
   const pinnedReviews = reviews.filter(r => r.pinned);
   const normalReviews = reviews.filter(r => !r.pinned);
   const sortedReviews = [...pinnedReviews, ...normalReviews];
@@ -1956,7 +2066,7 @@ function renderBookPage(id) {
   return `
     <div class="page book-page">
       <div class="book-identity">
-        <div class="book-identity-cover${coverImg ? ' has-cover' : ''}" style="${coverImg ? 'background-image:url(' + coverImg + ')' : 'background:linear-gradient(135deg,' + coverColor(book.title) + ')'}">${coverImg ? '' : book.title[0]}</div>
+        <div class="${coverClass('book-identity-cover', coverImg)}" data-img-url="${coverImg}" data-img-context="book-detail-cover:${id}" style="${imageBg(coverImg, 'background:linear-gradient(135deg,' + coverColor(book.title) + ')')}">${coverImg ? '' : imageFallback(book.title)}</div>
         <div class="book-identity-body">
           <h1 class="book-identity-title">${book.title}</h1>
           <div class="book-identity-meta">
@@ -1976,9 +2086,8 @@ function renderBookPage(id) {
             ${state.loggedIn && !isAuthor ? (() => {
   const td = new Date().toDateString();
   const lv = state.user.level || 1;
-  const maxF = lv >= 5 ? 3 : 2;
-  const used = state.flameDate === td ? state.flamesGiven : 0;
-  const rem = Math.max(0, maxF - used);
+  const maxF = dailyFlameAllowance(lv);
+  const rem = serverOnline ? (state.flamesRemaining ?? maxF) : Math.max(0, maxF - (state.flameDate === td ? state.flamesGiven : 0));
   return `<button class="btn btn-flame book-flame" data-book="${id}" style="padding:5px 10px">${rem > 0 ? 'Give ' + rem + ' Flame' + (rem > 1 ? 's' : '') : 'Given'}</button>`;
 })() : ''}
           </div>
@@ -2056,7 +2165,7 @@ function renderBookPage(id) {
           <div class="char-grid">
             ${chars.length ? chars.map(c => `
             <div class="char-card">
-              <div class="char-card-img${c.image ? ' has-img' : ''}" style="${c.image ? 'background-image:url(' + c.image + ')' : ''}">${c.image ? '' : c.name[0]}</div>
+              <div class="${imageClass('char-card-img', c.image || c.portrait)}" data-img-url="${c.image || c.portrait || ''}" data-img-context="character:${c.id}" style="${imageBg(c.image || c.portrait, '')}">${(c.image || c.portrait) ? '' : imageFallback(c.name)}</div>
               <h4 class="char-card-name">${c.name}</h4>
               <span class="char-card-role">${c.role || 'Character'}</span>
             </div>
@@ -2132,9 +2241,12 @@ function renderBookPage(id) {
 function renderChapterReader(bookId, chapterId) {
   const book = getBook(bookId);
   if (!book) return '<div class="page"><h2>Book not found</h2></div>';
+  const isAuthor = state.loggedIn && book.author === state.user.username;
+  if (!isAuthor && !isPublicBook(book)) return '<div class="page"><h2>Book not found</h2></div>';
   const chapters = state.chapters[bookId] || [];
   const ch = chapters.find(c => c.id === chapterId);
   if (!ch) return '<div class="page"><h2>Chapter not found</h2></div>';
+  if (!isAuthor && !ch.published) return '<div class="page"><h2>Chapter not found</h2></div>';
 
   // Save reading progress
   if (state.loggedIn) {
@@ -2170,14 +2282,13 @@ function renderChapterReader(bookId, chapterId) {
   const lv = state.user.level || 1;
   const maxF = dailyFlameAllowance(lv);
   const rem = serverOnline ? (state.flamesRemaining ?? maxF) : (state.flameDate === td ? Math.max(0, maxF - state.flamesGiven) : maxF);
-  const isAuthor = state.loggedIn && book.author === state.user.username;
 
   // EXP data
   const userExp = state.user.exp || 0;
   const userLvl = state.user.level || 1;
   const expNeeded = expForLevel(userLvl);
   const expPct = Math.min(100, Math.round((userExp / expNeeded) * 100));
-  const flameRules = lv >= 21 ? '2/day' : lv >= 11 ? '3/day' : lv >= 5 ? '4/day' : '2/day';
+  const flameRules = `${maxF}/day`;
 
   // Comments
   const chComments = getChapterComments(bookId, chapterId);
@@ -2920,7 +3031,12 @@ function bindPageEvents(route) {
       const file = this.files[0];
       if (!file) return;
       const reader = new FileReader();
-      reader.onload = e => { state.user.banner = e.target.result; saveState(); render(); };
+      reader.onload = e => {
+        state.user.banner = e.target.result;
+        saveState();
+        syncUpdateProfile({ banner: state.user.banner });
+        render();
+      };
       reader.readAsDataURL(file);
     });
   }
@@ -2932,7 +3048,12 @@ function bindPageEvents(route) {
       const file = this.files[0];
       if (!file) return;
       const reader = new FileReader();
-      reader.onload = e => { state.user.avatar = e.target.result; saveState(); render(); };
+      reader.onload = e => {
+        state.user.avatar = e.target.result;
+        saveState();
+        syncUpdateProfile({ avatar: state.user.avatar });
+        render();
+      };
       reader.readAsDataURL(file);
     });
   }
@@ -2947,6 +3068,7 @@ function bindPageEvents(route) {
       reader.onload = e => {
         state.user.avatar = e.target.result;
         saveState();
+        syncUpdateProfile({ avatar: state.user.avatar });
         render();
       };
       reader.readAsDataURL(file);
@@ -2959,6 +3081,7 @@ function bindPageEvents(route) {
     removeAvatarBtn.addEventListener('click', () => {
       state.user.avatar = '';
       saveState();
+      syncUpdateProfile({ avatar: '' });
       render();
     });
   }
@@ -2973,6 +3096,7 @@ function bindPageEvents(route) {
       reader.onload = e => {
         state.user.banner = e.target.result;
         saveState();
+        syncUpdateProfile({ banner: state.user.banner });
         render();
       };
       reader.readAsDataURL(file);
@@ -2985,6 +3109,7 @@ function bindPageEvents(route) {
     removeBannerBtn.addEventListener('click', () => {
       state.user.banner = '';
       saveState();
+      syncUpdateProfile({ banner: '' });
       render();
     });
   }
@@ -3002,6 +3127,7 @@ function bindPageEvents(route) {
       state.user.twitter = fd.get('twitter').trim() || '';
       state.user.facebook = fd.get('facebook').trim() || '';
       saveState();
+      syncUpdateProfile({ username: state.user.username, bio: state.user.bio, avatar: state.user.avatar || '', banner: state.user.banner || '' });
       navigate('#/profile');
     });
   }
@@ -3020,8 +3146,7 @@ function bindPageEvents(route) {
             const book = getBook(bookId);
             if (book) book.flames = res.bookFlames;
             state.flamesRemaining = res.remaining;
-            const gained = res.expGained || 10;
-            gainExp(gained, 'flame').then(() => render());
+            if (res.expReward) applyExpReward(res.expReward);
             saveState();
             if (fb) {
               fb.style.display = 'block';
