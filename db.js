@@ -190,6 +190,23 @@ db.exec(`
     FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE,
     UNIQUE(user_id, book_id)
   );
+
+  CREATE TABLE IF NOT EXISTS daily_reward_claims (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    reward_date TEXT NOT NULL,
+    last_reward_at TEXT NOT NULL,
+    claimed INTEGER DEFAULT 1,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE(user_id, action_type, reward_date)
+  );
 `);
+
+const columns = (table) => db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+const userColumns = columns('users');
+if (!userColumns.includes('googleId')) db.exec('ALTER TABLE users ADD COLUMN googleId TEXT');
+if (!userColumns.includes('facebookId')) db.exec('ALTER TABLE users ADD COLUMN facebookId TEXT');
+if (!userColumns.includes('twitterId')) db.exec('ALTER TABLE users ADD COLUMN twitterId TEXT');
 
 module.exports = db;

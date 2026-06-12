@@ -7,6 +7,7 @@ const FacebookStrategy = require('passport-facebook').Strategy;
 const TwitterStrategy = require('passport-twitter').Strategy;
 const db = require('./db');
 const crypto = require('crypto');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,6 +21,8 @@ const now = () => new Date().toISOString();
 // EXP thresholds: level * 100
 const expForLevel = lvl => lvl * 100;
 const dailyFlameAllowance = lvl => lvl >= 21 ? 5 : lvl >= 11 ? 4 : lvl >= 5 ? 3 : 2;
+const statusIsPublished = status => String(status || '').toLowerCase() !== 'draft';
+const publicBookWhere = "b.published = 1 AND b.visibility = 'public'";
 
 // Check & reset daily flames for a user
 function checkDailyReset(userId) {
@@ -47,12 +50,47 @@ function awardExp(userId, amount) {
     level++;
     leveledUp = true;
   }
-  db.prepare('UPDATE users SET exp = ?, level = ?, lifetime_exp = ?, flames_remaining = ? WHERE id = ?')
-    .run(exp, level, lifetime, leveledUp ? dailyFlameAllowance(level) : user.flames_remaining, userId);
-  if (leveledUp) {
-    db.prepare('UPDATE users SET last_flame_reset = ? WHERE id = ?').run(today(), userId);
-  }
+  db.prepare('UPDATE users SET exp = ?, level = ?, lifetime_exp = ? WHERE id = ?')
+    .run(exp, level, lifetime, userId);
   return { level, exp, needed: expForLevel(level), leveledUp };
+}
+
+function awardDailyExp(userId, actionType, amount) {
+  const d = today();
+  const existing = db.prepare('SELECT id FROM daily_reward_claims WHERE user_id = ? AND action_type = ? AND reward_date = ? AND claimed = 1')
+    .get(userId, actionType, d);
+  if (existing) {
+    const user = db.prepare('SELECT level, exp, lifetime_exp FROM users WHERE id = ?').get(userId);
+    return { awarded: false, amount: 0, level: user.level, exp: user.exp, needed: expForLevel(user.level), lifetime: user.lifetime_exp, leveledUp: false };
+  }
+
+  const result = awardExp(userId, amount);
+  db.prepare('INSERT INTO daily_reward_claims (id, user_id, action_type, reward_date, last_reward_at, claimed) VALUES (?,?,?,?,?,1)')
+    .run(uid(), userId, actionType, d, now());
+  return { ...result, awarded: true, amount };
+}
+
+function markDailyClaim(userId, actionType) {
+  db.prepare('INSERT OR IGNORE INTO daily_reward_claims (id, user_id, action_type, reward_date, last_reward_at, claimed) VALUES (?,?,?,?,?,1)')
+    .run(uid(), userId, actionType, today(), now());
+}
+
+function withBookStats(book) {
+  if (!book) return null;
+  book.tags = JSON.parse(book.tags || '[]');
+  const flames = db.prepare('SELECT COALESCE(total,0) as total FROM book_flames WHERE book_id = ?').get(book.id);
+  book.flames = flames ? flames.total : 0;
+  const chapterCount = db.prepare('SELECT COUNT(*) as c FROM chapters WHERE book_id = ?').get(book.id).c;
+  book.chapterCount = chapterCount;
+  const viewData = db.prepare('SELECT SUM(count) as t FROM daily_views WHERE book_id = ?').get(book.id);
+  book.views = viewData ? (viewData.t || 0) : 0;
+  book.author = book.author || book.username || '';
+  delete book.username;
+  return book;
+}
+
+function canReadBook(req, book) {
+  return book && (book.published && book.visibility === 'public' || (req.isAuthenticated && req.isAuthenticated() && req.user.id === book.author_id));
 }
 
 // ── Passport serialization ───────────────────────────
@@ -162,7 +200,8 @@ app.get('/api/auth/twitter/callback', passport.authenticate('twitter', { failure
 app.get('/api/user/:id', (req, res) => {
   const u = db.prepare('SELECT id, username, email, bio, level, exp, lifetime_exp, followers, theme, avatar, banner FROM users WHERE id = ?').get(req.params.id);
   if (!u) return res.status(404).json({ error: 'User not found' });
-  const bookCount = db.prepare('SELECT COUNT(*) as c FROM books WHERE author_id = ?').get(req.params.id).c;
+  const isOwner = req.isAuthenticated() && req.user.id === req.params.id;
+  const bookCount = db.prepare(`SELECT COUNT(*) as c FROM books WHERE author_id = ? ${isOwner ? '' : "AND published = 1 AND visibility = 'public'"}`).get(req.params.id).c;
   const flameTotal = db.prepare('SELECT COALESCE(SUM(amount),0) as t FROM flame_transactions WHERE recipient_id = ?').get(req.params.id).t;
   res.json({ ...u, bookCount, flameTotal });
 });
@@ -185,43 +224,43 @@ app.put('/api/user/settings', requireUser, (req, res) => {
 app.get('/api/books', (req, res) => {
   const { author_id } = req.query;
   let books;
-  if (author_id) books = db.prepare('SELECT * FROM books WHERE author_id = ? ORDER BY updated_at DESC').all(author_id);
-  else books = db.prepare('SELECT * FROM books WHERE published = 1 AND visibility = "public" ORDER BY updated_at DESC').all();
-  res.json(books.map(b => ({ ...b, tags: JSON.parse(b.tags || '[]') })));
+  if (author_id) {
+    const isOwner = req.isAuthenticated() && req.user.id === author_id;
+    books = db.prepare(`SELECT b.*, u.username FROM books b JOIN users u ON b.author_id = u.id WHERE b.author_id = ? ${isOwner ? '' : `AND ${publicBookWhere}`} ORDER BY b.updated_at DESC`).all(author_id);
+  } else {
+    books = db.prepare(`SELECT b.*, u.username FROM books b JOIN users u ON b.author_id = u.id WHERE ${publicBookWhere} ORDER BY b.updated_at DESC`).all();
+  }
+  res.json(books.map(withBookStats));
 });
 
 app.get('/api/books/:id', (req, res) => {
-  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id);
+  const book = db.prepare('SELECT b.*, u.username FROM books b JOIN users u ON b.author_id = u.id WHERE b.id = ?').get(req.params.id);
   if (!book) return res.status(404).json({ error: 'Book not found' });
-  book.tags = JSON.parse(book.tags || '[]');
-  const flames = db.prepare('SELECT COALESCE(total,0) as total FROM book_flames WHERE book_id = ?').get(book.id);
-  book.flames = flames.total;
-  const chapterCount = db.prepare('SELECT COUNT(*) as c FROM chapters WHERE book_id = ?').get(book.id).c;
-  book.chapterCount = chapterCount;
-  const viewData = db.prepare('SELECT SUM(count) as t FROM daily_views WHERE book_id = ?').get(book.id);
-  book.views = viewData ? (viewData.t || 0) : 0;
-  res.json(book);
+  if (!canReadBook(req, book)) return res.status(404).json({ error: 'Book not found' });
+  res.json(withBookStats(book));
 });
 
 app.post('/api/books', requireUser, (req, res) => {
   const { title, synopsis, genre, type, tags, cover, status, visibility } = req.body;
   const id = uid();
-  db.prepare('INSERT INTO books (id, author_id, title, synopsis, genre, type, tags, cover, status, visibility) VALUES (?,?,?,?,?,?,?,?,?,?)')
-    .run(id, req.user.id, title || 'Untitled', synopsis || '', genre || '', type || 'novel', JSON.stringify(tags || []), cover || '', status || 'ongoing', visibility || 'public');
-  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(id);
-  book.tags = JSON.parse(book.tags || '[]');
-  res.json(book);
+  const nextStatus = status || 'Draft';
+  const published = statusIsPublished(nextStatus) ? 1 : 0;
+  db.prepare('INSERT INTO books (id, author_id, title, synopsis, genre, type, tags, cover, status, visibility, published) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+    .run(id, req.user.id, title || 'Untitled', synopsis || '', genre || '', type || 'Novel', JSON.stringify(tags || []), cover || '', nextStatus, visibility || 'public', published);
+  const book = db.prepare('SELECT b.*, u.username FROM books b JOIN users u ON b.author_id = u.id WHERE b.id = ?').get(id);
+  res.json(withBookStats(book));
 });
 
 app.put('/api/books/:id', requireUser, (req, res) => {
   const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id);
   if (!book || book.author_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
   const { title, synopsis, genre, type, tags, cover, status, visibility } = req.body;
-  db.prepare('UPDATE books SET title=COALESCE(?,title), synopsis=COALESCE(?,synopsis), genre=COALESCE(?,genre), type=COALESCE(?,type), tags=?, cover=COALESCE(?,cover), status=COALESCE(?,status), visibility=COALESCE(?,visibility), updated_at=? WHERE id=?')
-    .run(title, synopsis, genre, type, JSON.stringify(tags ?? JSON.parse(book.tags)), cover, status, visibility, now(), req.params.id);
-  const updated = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id);
-  updated.tags = JSON.parse(updated.tags || '[]');
-  res.json(updated);
+  const nextStatus = status ?? book.status;
+  const published = statusIsPublished(nextStatus) ? 1 : 0;
+  db.prepare('UPDATE books SET title=COALESCE(?,title), synopsis=COALESCE(?,synopsis), genre=COALESCE(?,genre), type=COALESCE(?,type), tags=?, cover=?, status=COALESCE(?,status), visibility=COALESCE(?,visibility), published=?, updated_at=? WHERE id=?')
+    .run(title, synopsis, genre, type, JSON.stringify(tags ?? JSON.parse(book.tags)), cover ?? book.cover, status, visibility, published, now(), req.params.id);
+  const updated = db.prepare('SELECT b.*, u.username FROM books b JOIN users u ON b.author_id = u.id WHERE b.id = ?').get(req.params.id);
+  res.json(withBookStats(updated));
 });
 
 app.delete('/api/books/:id', requireUser, (req, res) => {
@@ -235,27 +274,35 @@ app.put('/api/books/:id/publish', requireUser, (req, res) => {
   const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id);
   if (!book || book.author_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
   const published = book.published ? 0 : 1;
-  db.prepare('UPDATE books SET published=?, updated_at=? WHERE id=?').run(published, now(), req.params.id);
+  db.prepare('UPDATE books SET published=?, status=?, updated_at=? WHERE id=?').run(published, published ? 'Ongoing' : 'Draft', now(), req.params.id);
   res.json({ published: !!published });
 });
 
 app.post('/api/books/:id/view', (req, res) => {
+  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id);
+  if (!canReadBook(req, book)) return res.status(404).json({ error: 'Book not found' });
   const d = today();
   const row = db.prepare('SELECT id, count FROM daily_views WHERE book_id = ? AND date = ?').get(req.params.id, d);
   if (row) db.prepare('UPDATE daily_views SET count = count + 1 WHERE id = ?').run(row.id);
-  else db.prepare('INSERT INTO daily_views (book_id, date) VALUES (?,?)').run(req.params.id, d);
+  else db.prepare('INSERT INTO daily_views (id, book_id, date) VALUES (?,?,?)').run(uid(), req.params.id, d);
   res.json({ ok: true });
 });
 
 // ── Chapters API ─────────────────────────────────────
 app.get('/api/books/:bookId/chapters', (req, res) => {
-  const chapters = db.prepare('SELECT id, book_id, title, published, word_count, created_at, updated_at FROM chapters WHERE book_id = ? ORDER BY created_at ASC').all(req.params.bookId);
+  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.bookId);
+  if (!canReadBook(req, book)) return res.status(404).json({ error: 'Book not found' });
+  const owner = req.isAuthenticated() && req.user.id === book.author_id;
+  const chapters = db.prepare(`SELECT id, book_id, title, published, word_count, created_at, updated_at FROM chapters WHERE book_id = ? ${owner ? '' : 'AND published = 1'} ORDER BY created_at ASC`).all(req.params.bookId);
   res.json(chapters);
 });
 
 app.get('/api/chapters/:id', (req, res) => {
   const ch = db.prepare('SELECT * FROM chapters WHERE id = ?').get(req.params.id);
   if (!ch) return res.status(404).json({ error: 'Chapter not found' });
+  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(ch.book_id);
+  const owner = req.isAuthenticated() && req.user.id === book.author_id;
+  if (!canReadBook(req, book) || (!owner && !ch.published)) return res.status(404).json({ error: 'Chapter not found' });
   res.json(ch);
 });
 
@@ -330,6 +377,8 @@ app.post('/api/chapters/:chapterId/revisions/:revId/restore', requireUser, (req,
 
 // ── Characters API ───────────────────────────────────
 app.get('/api/books/:bookId/characters', (req, res) => {
+  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.bookId);
+  if (!canReadBook(req, book)) return res.status(404).json({ error: 'Book not found' });
   const chars = db.prepare('SELECT * FROM characters WHERE book_id = ? ORDER BY created_at ASC').all(req.params.bookId);
   res.json(chars.map(c => ({ ...c, relationships: JSON.parse(c.relationships || '[]'), abilities: JSON.parse(c.abilities || '[]'), gallery: JSON.parse(c.gallery || '[]') })));
 });
@@ -374,19 +423,22 @@ app.delete('/api/characters/:id', requireUser, (req, res) => {
 
 // ── Reviews API ──────────────────────────────────────
 app.get('/api/books/:bookId/reviews', (req, res) => {
+  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.bookId);
+  if (!canReadBook(req, book)) return res.status(404).json({ error: 'Book not found' });
   const reviews = db.prepare('SELECT r.*, u.username FROM reviews r JOIN users u ON r.user_id = u.id WHERE r.book_id = ? ORDER BY r.pinned DESC, r.created_at DESC').all(req.params.bookId);
   res.json(reviews);
 });
 
 app.post('/api/books/:bookId/reviews', requireUser, (req, res) => {
   const { rating, content } = req.body;
+  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.bookId);
+  if (!canReadBook(req, book)) return res.status(404).json({ error: 'Book not found' });
   const id = uid();
   db.prepare('INSERT INTO reviews (id, book_id, user_id, rating, content) VALUES (?,?,?,?,?)')
     .run(id, req.params.bookId, req.user.id, rating || 5, content || '');
   const rev = db.prepare('SELECT r.*, u.username FROM reviews r JOIN users u ON r.user_id = u.id WHERE r.id = ?').get(id);
-  // Award EXP for review
-  awardExp(req.user.id, 20);
-  res.json(rev);
+  const reward = awardDailyExp(req.user.id, 'daily_review', 20);
+  res.json({ ...rev, expReward: reward });
 });
 
 app.delete('/api/reviews/:id', requireUser, (req, res) => {
@@ -417,19 +469,35 @@ app.put('/api/reviews/:id/like', requireUser, (req, res) => {
 
 // ── Chapter Comments API ─────────────────────────────
 app.get('/api/chapters/:chapterId/comments', (req, res) => {
+  const ch = db.prepare('SELECT * FROM chapters WHERE id = ?').get(req.params.chapterId);
+  if (!ch) return res.status(404).json({ error: 'Chapter not found' });
+  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(ch.book_id);
+  const owner = req.isAuthenticated() && req.user.id === book.author_id;
+  if (!canReadBook(req, book) || (!owner && !ch.published)) return res.status(404).json({ error: 'Chapter not found' });
   const comments = db.prepare('SELECT c.*, u.username FROM chapter_comments c JOIN users u ON c.user_id = u.id WHERE c.chapter_id = ? ORDER BY c.created_at ASC').all(req.params.chapterId);
   res.json(comments);
 });
 
 app.post('/api/chapters/:chapterId/comments', requireUser, (req, res) => {
-  const { content } = req.body;
+  const { content, paragraph_index } = req.body;
   if (!content || !content.trim()) return res.status(400).json({ error: 'Content required' });
+  const ch = db.prepare('SELECT * FROM chapters WHERE id = ?').get(req.params.chapterId);
+  if (!ch) return res.status(404).json({ error: 'Chapter not found' });
+  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(ch.book_id);
+  const owner = req.user.id === book.author_id;
+  if (!canReadBook(req, book) || (!owner && !ch.published)) return res.status(404).json({ error: 'Chapter not found' });
   const id = uid();
-  db.prepare('INSERT INTO chapter_comments (id, chapter_id, user_id, content) VALUES (?,?,?,?)')
-    .run(id, req.params.chapterId, req.user.id, content);
+  const pIndex = Number.isInteger(paragraph_index) ? paragraph_index : -1;
+  db.prepare('INSERT INTO chapter_comments (id, chapter_id, user_id, content, paragraph_index) VALUES (?,?,?,?,?)')
+    .run(id, req.params.chapterId, req.user.id, content, pIndex);
   const comment = db.prepare('SELECT c.*, u.username FROM chapter_comments c JOIN users u ON c.user_id = u.id WHERE c.id = ?').get(id);
-  awardExp(req.user.id, 10);
-  res.json(comment);
+  const firstCommentClaimed = db.prepare('SELECT id FROM daily_reward_claims WHERE user_id = ? AND action_type = ? AND reward_date = ? AND claimed = 1')
+    .get(req.user.id, 'daily_first_comment', today());
+  const specificAction = pIndex >= 0 ? 'daily_paragraph_comment' : 'daily_chapter_comment';
+  if (!firstCommentClaimed) markDailyClaim(req.user.id, specificAction);
+  const action = firstCommentClaimed ? specificAction : 'daily_first_comment';
+  const reward = awardDailyExp(req.user.id, action, 10);
+  res.json({ ...comment, expReward: reward });
 });
 
 app.delete('/api/comments/:id', requireUser, (req, res) => {
@@ -447,6 +515,8 @@ app.get('/api/user/flames/remaining', requireUser, (req, res) => {
 });
 
 app.get('/api/books/:bookId/flames', (req, res) => {
+  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.bookId);
+  if (!canReadBook(req, book)) return res.status(404).json({ error: 'Book not found' });
   const row = db.prepare('SELECT COALESCE(total,0) as total FROM book_flames WHERE book_id = ?').get(req.params.bookId);
   const total = row ? row.total : 0;
   res.json({ total });
@@ -456,28 +526,23 @@ app.post('/api/books/:bookId/flame', requireUser, (req, res) => {
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   if (user.flames_remaining <= 0) return res.status(400).json({ error: 'No flames remaining today' });
   const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.bookId);
-  if (!book) return res.status(404).json({ error: 'Book not found' });
+  if (!canReadBook(req, book)) return res.status(404).json({ error: 'Book not found' });
   if (book.author_id === req.user.id) return res.status(400).json({ error: 'Cannot flame your own book' });
 
-  const amount = user.flames_remaining;
-  db.prepare('UPDATE users SET flames_remaining = 0 WHERE id = ?').run(req.user.id);
+  const requested = Math.max(1, Math.min(parseInt(req.body.amount || '1', 10) || 1, user.flames_remaining));
+  db.transaction(() => {
+    db.prepare('UPDATE users SET flames_remaining = flames_remaining - ? WHERE id = ?').run(requested, req.user.id);
+    db.prepare('INSERT INTO book_flames (book_id, total) VALUES (?,?) ON CONFLICT(book_id) DO UPDATE SET total = total + excluded.total')
+      .run(req.params.bookId, requested);
+    db.prepare('INSERT INTO flame_transactions (id, sender_id, recipient_id, book_id, amount) VALUES (?,?,?,?,?)')
+      .run(uid(), req.user.id, book.author_id, req.params.bookId, requested);
+  })();
 
-  // Add book flames
-  const bf = db.prepare('SELECT total FROM book_flames WHERE book_id = ?').get(req.params.bookId);
-  if (bf) db.prepare('UPDATE book_flames SET total = total + ? WHERE book_id = ?').run(amount, req.params.bookId);
-  else db.prepare('INSERT INTO book_flames (book_id, total) VALUES (?,?)').run(req.params.bookId, amount);
-
-  // Record transactions
-  const txId = uid();
-  db.prepare('INSERT INTO flame_transactions (id, sender_id, recipient_id, book_id, amount) VALUES (?,?,?,?,?)')
-    .run(txId, req.user.id, book.author_id, req.params.bookId, amount);
-
-  // Award EXP: +10 per flame
-  awardExp(req.user.id, amount * 10);
+  const reward = awardDailyExp(req.user.id, 'daily_flame_given', 10);
 
   const updated = db.prepare('SELECT flames_remaining FROM users WHERE id = ?').get(req.user.id);
   const bfUpdated = db.prepare('SELECT COALESCE(total,0) as total FROM book_flames WHERE book_id = ?').get(req.params.bookId);
-  res.json({ remaining: updated.flames_remaining, bookFlames: bfUpdated.total, given: amount, expGained: amount * 10 });
+  res.json({ remaining: updated.flames_remaining, bookFlames: bfUpdated.total, given: requested, expGained: reward.amount, expReward: reward });
 });
 
 app.post('/api/chapters/:chapterId/flame', requireUser, (req, res) => {
@@ -486,22 +551,21 @@ app.post('/api/chapters/:chapterId/flame', requireUser, (req, res) => {
   const ch = db.prepare('SELECT * FROM chapters WHERE id = ?').get(req.params.chapterId);
   if (!ch) return res.status(404).json({ error: 'Chapter not found' });
   const book = db.prepare('SELECT * FROM books WHERE id = ?').get(ch.book_id);
+  if (!canReadBook(req, book) || !ch.published) return res.status(404).json({ error: 'Chapter not found' });
   if (book.author_id === req.user.id) return res.status(400).json({ error: 'Cannot flame your own book' });
 
-  db.prepare('UPDATE users SET flames_remaining = flames_remaining - 1 WHERE id = ?').run(req.user.id);
+  db.transaction(() => {
+    db.prepare('UPDATE users SET flames_remaining = flames_remaining - 1 WHERE id = ?').run(req.user.id);
+    db.prepare('INSERT INTO book_flames (book_id, total) VALUES (?,1) ON CONFLICT(book_id) DO UPDATE SET total = total + 1').run(ch.book_id);
+    db.prepare('INSERT INTO flame_transactions (id, sender_id, recipient_id, book_id, amount) VALUES (?,?,?,?,?)')
+      .run(uid(), req.user.id, book.author_id, ch.book_id, 1);
+  })();
 
-  const bf = db.prepare('SELECT total FROM book_flames WHERE book_id = ?').get(ch.book_id);
-  if (bf) db.prepare('UPDATE book_flames SET total = total + 1 WHERE book_id = ?').run(ch.book_id);
-  else db.prepare('INSERT INTO book_flames (book_id, total) VALUES (?,1)').run(ch.book_id);
-
-  db.prepare('INSERT INTO flame_transactions (id, sender_id, recipient_id, book_id, amount) VALUES (?,?,?,?,?)')
-    .run(uid(), req.user.id, book.author_id, ch.book_id, 1);
-
-  awardExp(req.user.id, 10);
+  const reward = awardDailyExp(req.user.id, 'daily_flame_given', 10);
 
   const updated = db.prepare('SELECT flames_remaining FROM users WHERE id = ?').get(req.user.id);
   const bfUpdated = db.prepare('SELECT COALESCE(total,0) as total FROM book_flames WHERE book_id = ?').get(ch.book_id);
-  res.json({ remaining: updated.flames_remaining, bookFlames: bfUpdated.total });
+  res.json({ remaining: updated.flames_remaining, bookFlames: bfUpdated.total, expGained: reward.amount, expReward: reward });
 });
 
 // ── EXP API ──────────────────────────────────────────
@@ -512,7 +576,9 @@ app.get('/api/user/exp', requireUser, (req, res) => {
 
 app.post('/api/user/exp/gain', requireUser, (req, res) => {
   const { amount, reason } = req.body;
-  const result = awardExp(req.user.id, amount || 5);
+  const dailyReasons = new Set(['comment', 'chapter_comment', 'paragraph_comment', 'review', 'flame', 'read', 'daily_reading']);
+  const actionType = reason === 'read' || reason === 'daily_reading' ? 'daily_reading' : `daily_${reason || 'manual'}`;
+  const result = dailyReasons.has(reason) ? awardDailyExp(req.user.id, actionType, amount || 5) : awardExp(req.user.id, amount || 5);
   // Create notification on level up
   if (result.leveledUp) {
     db.prepare('INSERT INTO notifications (id, user_id, type, message) VALUES (?,?,?,?)')
@@ -609,6 +675,8 @@ app.delete('/api/wall/posts/:id', requireUser, (req, res) => {
 
 // ── Favorites API ────────────────────────────────────
 app.post('/api/favorites/:bookId', requireUser, (req, res) => {
+  const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.bookId);
+  if (!canReadBook(req, book) || book.author_id === req.user.id) return res.status(404).json({ error: 'Book not found' });
   const existing = db.prepare('SELECT id FROM favorites WHERE user_id = ? AND book_id = ?').get(req.user.id, req.params.bookId);
   if (existing) {
     db.prepare('DELETE FROM favorites WHERE id = ?').run(existing.id);
@@ -620,13 +688,13 @@ app.post('/api/favorites/:bookId', requireUser, (req, res) => {
 });
 
 app.get('/api/favorites/:user', (req, res) => {
-  const favorites = db.prepare('SELECT f.*, b.title FROM favorites f JOIN books b ON f.book_id = b.id WHERE f.user_id = ?').all(req.params.user);
+  const favorites = db.prepare("SELECT f.*, b.title FROM favorites f JOIN books b ON f.book_id = b.id WHERE f.user_id = ? AND b.published = 1 AND b.visibility = 'public'").all(req.params.user);
   res.json(favorites);
 });
 
 app.get('/api/user/favorites', requireUser, (req, res) => {
-  const books = db.prepare('SELECT b.*, f.created_at as favorited_at FROM favorites f JOIN books b ON f.book_id = b.id WHERE f.user_id = ? ORDER BY f.created_at DESC').all(req.user.id);
-  res.json(books.map(b => ({ ...b, tags: JSON.parse(b.tags || '[]') })));
+  const books = db.prepare("SELECT b.*, u.username, f.created_at as favorited_at FROM favorites f JOIN books b ON f.book_id = b.id JOIN users u ON b.author_id = u.id WHERE f.user_id = ? AND b.published = 1 AND b.visibility = 'public' ORDER BY f.created_at DESC").all(req.user.id);
+  res.json(books.map(withBookStats));
 });
 
 // ── Follows API ──────────────────────────────────────
@@ -658,6 +726,8 @@ app.get('*', (req, res) => {
 });
 
 // ── Start ────────────────────────────────────────────
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Flow World server running at ${APP_URL}`);
 });
+
+module.exports = server;
