@@ -11,6 +11,29 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
   <link rel="apple-touch-icon" href="Icons/app.png">
   <link rel="stylesheet" href="styles.css">
+  <script type="module">
+  // Import the functions you need from the SDKs you need
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-app.js";
+  import { getAnalytics } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-analytics.js";
+  // TODO: Add SDKs for Firebase products that you want to use
+  // https://firebase.google.com/docs/web/setup#available-libraries
+
+  // Your web app's Firebase configuration
+  // For Firebase JS SDK v7.20.0 and later, measurementId is optional
+  const firebaseConfig = {
+    apiKey: "AIzaSyCWNQWedXPoaLH19iCTyJm6vp41S0s6bEI",
+    authDomain: "flow-47196.firebaseapp.com",
+    projectId: "flow-47196",
+    storageBucket: "flow-47196.firebasestorage.app",
+    messagingSenderId: "749590330272",
+    appId: "1:749590330272:web:d79bfa6897d6ac144c82c5",
+    measurementId: "G-0TQ93NKD2Q"
+  };
+
+  // Initialize Firebase
+  const app = initializeApp(firebaseConfig);
+  const analytics = getAnalytics(app);
+</script>
 </head>
 <body>
   <div id="root"></div>
