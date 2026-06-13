@@ -41,6 +41,8 @@ function getState() {
     chapterComments: {},
     chapterReactions: {},
     readingProgress: [],
+    achievements: {},
+    achievementStats: { books: 0, views: 0, flames: 0, completedBooks: 0, comments: 0, chaptersRead: 0, flamesGiven: 0, authorsSupported: 0, reviews: 0, level: 1 },
   };
   try {
     const saved = localStorage.getItem('novelState');
@@ -55,6 +57,158 @@ function saveState() {
 
 let state = getState();
 let accounts = getAccounts();
+let firebaseUserId = null;
+
+// ── Firebase Data Loading ──────────────────
+async function loadAllFirestoreData() {
+  if (!firebaseUserId) return;
+  await Promise.all([
+    loadFirestoreBooks().catch(() => {}),
+    loadFirestoreChapters().catch(() => {}),
+    loadFirestoreCharacters().catch(() => {}),
+    loadFirestoreReadingProgress().catch(() => {}),
+    loadFirestoreReviews().catch(() => {}),
+    loadFirestoreComments().catch(() => {}),
+    loadFirestoreNotifications().catch(() => {}),
+    loadFirestoreFavorites().catch(() => {}),
+    loadFirestoreAchievements().catch(() => {}),
+  ]);
+  saveState();
+}
+
+async function loadFirestoreBooks() {
+  const myBooks = await FB.getBooks(firebaseUserId);
+  state.books = (myBooks || []).map(b => ({
+    id: b.id, author: b.authorId, title: b.title, synopsis: b.synopsis || '',
+    genre: b.genre || '', tags: b.tags || [], type: b.type || 'Novel',
+    status: b.status || 'Draft', chapterCount: b.chapterCount || 0,
+    views: b.views || 0, favorites: b.favorites || 0, flames: b.flames || 0,
+    rating: 0, ratingCount: 0, cover: b.cover || '',
+    dailyViews: {},
+    createdAt: b.createdAt ? new Date(b.createdAt.seconds*1000).toISOString().split('T')[0] : today(),
+    updatedAt: b.updatedAt ? new Date(b.updatedAt.seconds*1000).toISOString().split('T')[0] : today(),
+    _firebaseId: b.id
+  }));
+}
+
+async function loadFirestoreChapters() {
+  for (const book of state.books) {
+    const fbId = book._firebaseId || book.id;
+    const chapters = await FB.getChapters(fbId);
+    if (chapters && chapters.length) {
+      state.chapters[book.id] = chapters.map((ch, i) => ({
+        id: ch.id, bookId: book.id, title: ch.title || 'Untitled',
+        content: ch.content || '', published: ch.published || false,
+        chapterNumber: ch.chapterNumber || (i + 1),
+        createdAt: ch.createdAt ? new Date(ch.createdAt.seconds*1000).toISOString().split('T')[0] : '',
+        updatedAt: ch.updatedAt ? new Date(ch.updatedAt.seconds*1000).toISOString().split('T')[0] : '',
+        _firebaseId: ch.id
+      }));
+    }
+  }
+}
+
+async function loadFirestoreCharacters() {
+  for (const book of state.books) {
+    const fbId = book._firebaseId || book.id;
+    const chars = await FB.getCharacters(fbId);
+    if (chars && chars.length) {
+      state.characters[book.id] = chars.map(c => ({
+        id: c.id, bookId: book.id, name: c.name || '', role: c.role || '',
+        description: c.biography || c.description || '', image: c.portrait || c.image || '',
+        _firebaseId: c.id
+      }));
+    }
+  }
+}
+
+async function loadFirestoreReadingProgress() {
+  const progress = await FB.getAllReadingProgress(firebaseUserId);
+  if (progress) state.readingProgress = progress;
+}
+
+async function loadFirestoreReviews() {
+  for (const book of state.books) {
+    const fbId = book._firebaseId || book.id;
+    const reviews = await FB.getReviews(fbId);
+    if (reviews && reviews.length) {
+      state.reviews[book.id] = reviews.map(r => ({
+        id: r.id, bookId: book.id, username: r.username || r.userId,
+        content: r.content || '', rating: r.rating || 5,
+        pinned: r.pinned || false, likes: r.likes || 0,
+        createdAt: r.createdAt ? new Date(r.createdAt.seconds*1000).toISOString().split('T')[0] : '',
+        _firebaseId: r.id
+      }));
+    }
+  }
+}
+
+async function loadFirestoreComments() {
+  for (const book of state.books) {
+    for (const ch of (state.chapters[book.id] || [])) {
+      const chId = ch._firebaseId || ch.id;
+      const comments = await FB.getChapterComments(chId);
+      if (comments && comments.length) {
+        const key = book.id + '_' + ch.id;
+        state.chapterComments[key] = comments.map(c => ({
+          id: c.id, username: c.username || c.userId, content: c.content || '',
+          createdAt: c.createdAt ? new Date(c.createdAt.seconds*1000).toISOString().split('T')[0] : '',
+          _firebaseId: c.id
+        }));
+      }
+    }
+  }
+}
+
+async function loadFirestoreNotifications() {
+  const notifs = await FB.getNotifications(firebaseUserId);
+  if (notifs) state.notifications = notifs;
+}
+
+async function loadFirestoreFavorites() {
+  const favs = await FB.getUserFavorites(firebaseUserId);
+  if (favs) state.favorites = favs.map(f => f.id || f.bookId);
+}
+
+async function loadFirestoreAchievements() {
+  if (!firebaseUserId || !FB.isFirebaseReady || !FB.isFirebaseReady()) return;
+  const earned = await FB.getAchievements(firebaseUserId);
+  if (earned) state.achievements = earned;
+}
+
+// ── One-time migration: uploads existing localStorage data to Firestore ──
+async function migrateLocalData() {
+  if (!firebaseUserId) return;
+  const migratedKey = '_migrated_' + firebaseUserId;
+  if (state[migratedKey]) return;
+  state[migratedKey] = true;
+  // Books: upload any that don't have _firebaseId
+  for (const book of state.books) {
+    if (!book._firebaseId) {
+      try {
+        const fbBook = await FB.createBook({
+          title: book.title, synopsis: book.synopsis, genre: book.genre,
+          type: book.type, tags: book.tags || [], status: book.status
+        }, firebaseUserId);
+        book._firebaseId = fbBook.id;
+        // Upload chapters for this book
+        const chapters = state.chapters[book.id] || [];
+        for (const ch of chapters) {
+          if (!ch._firebaseId) {
+            try {
+              const fbCh = await FB.createChapter(fbBook.id, {
+                title: ch.title, content: ch.content, published: ch.published,
+                chapterNumber: ch.chapterNumber || 1
+              });
+              ch._firebaseId = fbCh.id;
+            } catch (e) { /* skip */ }
+          }
+        }
+      } catch (e) { /* skip */ }
+    }
+  }
+  saveState();
+}
 
 function loginAs(email) {
   const acct = accounts[email];
@@ -68,6 +222,28 @@ function logoutUser() {
   state.loggedIn = false;
   state.user = { username: 'Guest', bio: '', level: 1, rank: 0, followers: 0, email: '' };
   saveState();
+}
+
+async function checkAchievements() {
+  if (!firebaseUserId || !FB.isFirebaseReady || !FB.isFirebaseReady()) return;
+  const myBooks = getBooksByAuthor();
+  const totalViews = myBooks.reduce((s,b) => s + (b.views || 0), 0);
+  const totalFlames = myBooks.reduce((s,b) => s + (b.flames || 0), 0);
+  const compBooks = myBooks.filter(b => b.status === 'Completed').length;
+  const stats = {
+    books: myBooks.length, views: totalViews, flames: totalFlames,
+    completedBooks: compBooks, comments: state.achievementStats.comments || 0,
+    chaptersRead: state.achievementStats.chaptersRead || 0,
+    flamesGiven: state.achievementStats.flamesGiven || 0,
+    authorsSupported: state.achievementStats.authorsSupported || 0,
+    reviews: state.achievementStats.reviews || 0,
+    level: state.user.level || 1,
+  };
+  const newOnes = await FB.checkAndEarnAchievements(firebaseUserId, stats);
+  for (const a of newOnes) {
+    state.achievements[a.id] = { achievementId: a.id, label: a.label, icon: a.icon, earnedAt: new Date().toISOString() };
+  }
+  if (newOnes.length) { saveState(); render(); }
 }
 
 // Backend API helper
@@ -87,15 +263,61 @@ async function checkServer() {
   return serverOnline;
 }
 
-// Try backend auth; fall back to localStorage
+// Try Firebase auth first, then backend, fall back to localStorage
 async function initAuth() {
+  // Try Firebase Auth
+  if (FB.isFirebaseReady && FB.isFirebaseReady()) {
+    await new Promise(resolve => {
+      FB.onAuthChanged(async user => {
+        if (user) {
+          firebaseUserId = user.uid;
+          state.loggedIn = true;
+          state.user.email = user.email || '';
+          state.user.username = user.displayName || user.email || 'User';
+          const fbUser = await FB.getUser(user.uid);
+          if (fbUser) {
+            state.user.level = fbUser.level || 1;
+            state.user.exp = fbUser.exp || 0;
+            state.user.lifetime_exp = fbUser.lifetimeExp || 0;
+            state.user.bio = fbUser.bio || '';
+            state.user.avatar = fbUser.avatar || '';
+            state.user.banner = fbUser.banner || '';
+            state.user.followers = fbUser.followers || 0;
+            state.theme = fbUser.theme || state.theme;
+            state.flameAllowance = dailyFlameAllowance(fbUser.level || 1);
+            state.flamesRemaining = fbUser.dailyFlamesRemaining || 0;
+          }
+          await loadAllFirestoreData();
+          await migrateLocalData();
+          FB.checkDailyReset(firebaseUserId).then(remaining => { if (remaining != null) state.flamesRemaining = remaining; saveState(); render(); }).catch(() => {});
+          applyTheme(state.theme);
+          checkAchievements();
+        } else {
+          // Try server fallback
+          const data = await apiFetch('/api/auth/me');
+          if (data && data.loggedIn) {
+            serverOnline = true;
+            state.loggedIn = true;
+            state.user = { ...state.user, ...data.user };
+            saveState();
+            loadServerData();
+          } else if (state.loggedIn && state.user.email && accounts[state.user.email]) {
+            loginAs(state.user.email);
+          }
+        }
+        resolve();
+      });
+    });
+    return;
+  }
+
+  // Server fallback
   const data = await apiFetch('/api/auth/me');
   if (data && data.loggedIn) {
     serverOnline = true;
     state.loggedIn = true;
     state.user = { ...state.user, ...data.user };
     saveState();
-    // Load user data from server
     loadServerData();
     return;
   }
@@ -180,193 +402,6 @@ async function apiSync(method, path, body) {
   return res;
 }
 
-async function syncCreateBook(book) {
-  const localId = book.id;
-  const res = await apiSync('POST', '/api/books', {
-    title: book.title, synopsis: book.synopsis, genre: book.genre,
-    type: book.type, tags: book.tags, cover: book.cover,
-    status: book.status, visibility: 'public'
-  });
-  if (res) {
-    const normalized = normalizeServerBook(res);
-    Object.assign(book, normalized);
-    if (localId !== book.id) {
-      state.chapters[book.id] = state.chapters[localId] || [];
-      state.characters[book.id] = state.characters[localId] || [];
-      delete state.chapters[localId];
-      delete state.characters[localId];
-    }
-    saveState();
-    render();
-  }
-}
-
-async function syncUpdateBook(id, data) {
-  const res = await apiSync('PUT', `/api/books/${id}`, data);
-  if (res) {
-    const book = getBook(id);
-    if (book) Object.assign(book, normalizeServerBook(res));
-    saveState();
-  }
-}
-
-async function syncDeleteBook(id) {
-  await apiSync('DELETE', `/api/books/${id}`);
-}
-
-async function syncPublishBook(id) {
-  const res = await apiSync('PUT', `/api/books/${id}/publish`);
-  return res ? res.published : undefined;
-}
-
-async function syncCreateChapter(bookId, chapter) {
-  const localId = chapter.id;
-  const res = await apiSync('POST', `/api/books/${bookId}/chapters`, {
-    title: chapter.title, content: chapter.content, published: chapter.published
-  });
-  if (res) {
-    Object.assign(chapter, res);
-    if (localId !== chapter.id) {
-      const key = bookId + '_' + localId;
-      const nextKey = bookId + '_' + chapter.id;
-      if (state.chapterComments[key]) {
-        state.chapterComments[nextKey] = state.chapterComments[key];
-        delete state.chapterComments[key];
-      }
-    }
-    saveState();
-  }
-}
-
-async function syncUpdateChapter(chapterId, data) {
-  await apiSync('PUT', `/api/chapters/${chapterId}`, data);
-}
-
-async function syncDeleteChapter(chapterId) {
-  await apiSync('DELETE', `/api/chapters/${chapterId}`);
-}
-
-async function syncCreateCharacter(bookId, char) {
-  const res = await apiSync('POST', `/api/books/${bookId}/characters`, {
-    name: char.name, biography: char.description, portrait: char.image
-  });
-  if (res) {
-    Object.assign(char, { ...res, image: res.portrait || char.image, description: res.biography || char.description });
-    saveState();
-  }
-}
-
-async function syncDeleteCharacter(charId) {
-  await apiSync('DELETE', `/api/characters/${charId}`);
-}
-
-async function syncRecordView(bookId) {
-  await apiSync('POST', `/api/books/${bookId}/view`);
-}
-
-async function syncGetFlamesRemaining() {
-  const res = await apiSync('GET', '/api/user/flames/remaining');
-  return res;
-}
-
-async function syncGiveFlame(bookId) {
-  const res = await apiSync('POST', `/api/books/${bookId}/flame`);
-  return res;
-}
-
-async function syncGiveSingleFlame(chapterId) {
-  const res = await apiSync('POST', `/api/chapters/${chapterId}/flame`);
-  return res;
-}
-
-async function syncAwardExp(amount, reason) {
-  const res = await apiSync('POST', '/api/user/exp/gain', { amount, reason });
-  return res;
-}
-
-async function syncUpdateProgress(bookId, data) {
-  const res = await apiSync('PUT', `/api/user/progress/${bookId}`, data);
-  return res;
-}
-
-async function syncCreateReview(bookId, review) {
-  const res = await apiSync('POST', `/api/books/${bookId}/reviews`, review);
-  return res;
-}
-
-async function syncDeleteReview(reviewId) {
-  await apiSync('DELETE', `/api/reviews/${reviewId}`);
-}
-
-async function syncTogglePinReview(reviewId) {
-  const res = await apiSync('PUT', `/api/reviews/${reviewId}/pin`);
-  return res;
-}
-
-async function syncToggleFavoriteReview(reviewId) {
-  const res = await apiSync('PUT', `/api/reviews/${reviewId}/like`);
-  return res ? res.likes : null;
-}
-
-async function syncCreateComment(chapterId, content) {
-  const res = await apiSync('POST', `/api/chapters/${chapterId}/comments`, { content });
-  return res;
-}
-
-async function syncDeleteComment(commentId) {
-  await apiSync('DELETE', `/api/comments/${commentId}`);
-}
-
-async function syncGetReviews(bookId) {
-  const res = await apiSync('GET', `/api/books/${bookId}/reviews`);
-  return res;
-}
-
-async function syncGetChapterComments(chapterId) {
-  const res = await apiSync('GET', `/api/chapters/${chapterId}/comments`);
-  return res;
-}
-
-async function syncGetRevisions(chapterId) {
-  const res = await apiSync('GET', `/api/chapters/${chapterId}/revisions`);
-  return res;
-}
-
-async function syncGetRevision(chapterId, revId) {
-  const res = await apiSync('GET', `/api/chapters/${chapterId}/revisions/${revId}`);
-  return res;
-}
-
-async function syncRestoreRevision(chapterId, revId) {
-  const res = await apiSync('POST', `/api/chapters/${chapterId}/revisions/${revId}/restore`);
-  return res;
-}
-
-async function syncFollow(userId) {
-  const res = await apiSync('POST', `/api/follow/${userId}`);
-  return res;
-}
-
-async function syncCheckFollow(userId) {
-  const res = await apiSync('GET', `/api/follow/check/${userId}`);
-  return res ? res.following : false;
-}
-
-async function syncToggleFavorite(bookId) {
-  const res = await apiSync('POST', `/api/favorites/${bookId}`);
-  return res ? res.favorited : undefined;
-}
-
-async function syncUpdateProfile(data) {
-  const res = await apiSync('PUT', '/api/user/profile', data);
-  return res;
-}
-
-async function syncUpdateSettings(data) {
-  const res = await apiSync('PUT', '/api/user/settings', data);
-  return res;
-}
-
 // EXP/Level helpers
 function expForLevel(lvl) { return lvl * 100; }
 function dailyFlameAllowance(lvl) { return lvl >= 21 ? 5 : lvl >= 11 ? 4 : lvl >= 5 ? 3 : 2; }
@@ -384,15 +419,7 @@ function applyExpReward(reward) {
   saveState();
 }
 
-async function gainExp(amount, reason) {
-  if (serverOnline) {
-    const res = await syncAwardExp(amount, reason);
-    if (res) {
-      applyExpReward(res);
-      return res;
-    }
-  }
-  // Fallback: local EXP
+function gainExp(amount, reason) {
   if (!state.user.exp) state.user.exp = 0;
   if (!state.user.level) state.user.level = 1;
   state.user.exp = (state.user.exp || 0) + amount;
@@ -475,34 +502,30 @@ function getBook(id) { return state.books.find(b => b.id === id); }
 function getBooksByAuthor() { return state.books.filter(b => b.author === state.user.username); }
 
 // ============================================================
-// CRUD OPERATIONS
+// CRUD OPERATIONS — Immediate local state + fire-and-forget Firestore
 // ============================================================
+function isFB() { return firebaseUserId && FB.isFirebaseReady && FB.isFirebaseReady(); }
+
 function createBook(data) {
   const book = {
-    id: genId(),
-    title: data.title,
-    author: data.author || state.user.username,
-    synopsis: data.synopsis || '',
-    genre: data.genre || '',
+    id: genId(), title: data.title, author: data.author || state.user.username,
+    synopsis: data.synopsis || '', genre: data.genre || '',
     tags: (data.tags || '').split(',').map(t => t.trim()).filter(Boolean),
-    type: data.type || 'Novel',
-    status: data.status || 'Draft',
-    chapterCount: 0,
-    views: 0,
-    favorites: 0,
-    flames: 0,
-    rating: 0,
-    ratingCount: 0,
-    cover: '',
-    dailyViews: {},
-    createdAt: today(),
-    updatedAt: today(),
+    type: data.type || 'Novel', status: data.status || 'Draft',
+    chapterCount: 0, views: 0, favorites: 0, flames: 0,
+    rating: 0, ratingCount: 0, cover: '', dailyViews: {},
+    createdAt: today(), updatedAt: today()
   };
   state.books.push(book);
   state.chapters[book.id] = [];
   state.characters[book.id] = [];
   saveState();
-  syncCreateBook(book);
+  if (isFB()) {
+    FB.createBook({
+      title: data.title, synopsis: data.synopsis, genre: data.genre,
+      type: data.type, tags: data.tags || [], status: data.status || 'Draft'
+    }, firebaseUserId).then(fbBook => { book._firebaseId = fbBook.id; saveState(); render(); checkAchievements(); }).catch(() => {});
+  }
   return book;
 }
 
@@ -511,40 +534,37 @@ function updateBook(id, data) {
   if (!book) return;
   Object.assign(book, data, { updatedAt: today() });
   saveState();
-  syncUpdateBook(id, data);
+  if (isFB() && book._firebaseId) FB.updateBook(book._firebaseId, data).catch(() => {});
 }
 
 function deleteBook(id) {
+  const book = getBook(id);
+  if (isFB() && book && book._firebaseId) FB.deleteBook(book._firebaseId).catch(() => {});
   state.books = state.books.filter(b => b.id !== id);
-  delete state.chapters[id];
-  delete state.characters[id];
+  delete state.chapters[id]; delete state.characters[id];
   state.favorites = state.favorites.filter(f => f !== id);
   delete state.flames[id];
   saveState();
-  syncDeleteBook(id);
 }
 
 function createChapter(bookId, data) {
   const chapters = state.chapters[bookId] || [];
   const chapter = {
-    id: genId(),
-    bookId,
-    title: data.title,
-    content: data.content || '',
-    published: data.published || false,
-    chapterNumber: chapters.length + 1,
-    createdAt: today(),
-    updatedAt: today(),
+    id: genId(), bookId, title: data.title, content: data.content || '',
+    published: data.published || false, chapterNumber: chapters.length + 1,
+    createdAt: today(), updatedAt: today()
   };
   chapters.push(chapter);
   state.chapters[bookId] = chapters;
   const book = getBook(bookId);
-  if (book) {
-    book.chapterCount = chapters.length;
-    book.updatedAt = today();
-  }
+  if (book) { book.chapterCount = chapters.length; book.updatedAt = today(); }
   saveState();
-  syncCreateChapter(bookId, chapter);
+  if (isFB() && book && book._firebaseId) {
+    FB.createChapter(book._firebaseId, {
+      title: data.title, content: data.content || '',
+      published: data.published || false, chapterNumber: chapter.chapterNumber
+    }).then(fbCh => { chapter._firebaseId = fbCh.id; saveState(); }).catch(() => {});
+  }
   return chapter;
 }
 
@@ -554,18 +574,16 @@ function updateChapter(bookId, chapterId, data) {
   if (!ch) return;
   Object.assign(ch, data, { updatedAt: today() });
   saveState();
-  syncUpdateChapter(chapterId, data);
+  if (isFB() && ch._firebaseId) FB.updateChapter(ch._firebaseId, data).catch(() => {});
 }
 
 function deleteChapter(bookId, chapterId) {
+  const ch = (state.chapters[bookId] || []).find(c => c.id === chapterId);
+  if (isFB() && ch && ch._firebaseId) FB.deleteChapter(ch._firebaseId).catch(() => {});
   state.chapters[bookId] = (state.chapters[bookId] || []).filter(c => c.id !== chapterId);
   const book = getBook(bookId);
-  if (book) {
-    book.chapterCount = state.chapters[bookId].length;
-    book.updatedAt = today();
-  }
+  if (book) { book.chapterCount = state.chapters[bookId].length; book.updatedAt = today(); }
   saveState();
-  syncDeleteChapter(chapterId);
 }
 
 function createCharacter(bookId, data) {
@@ -574,15 +592,29 @@ function createCharacter(bookId, data) {
   chars.push(ch);
   state.characters[bookId] = chars;
   saveState();
-  syncCreateCharacter(bookId, ch);
+  if (isFB()) {
+    const book = getBook(bookId);
+    if (book && book._firebaseId) {
+      FB.createCharacter(book._firebaseId, { name: data.name, biography: data.description || '', portrait: data.image || '' })
+        .then(fbCh => { ch._firebaseId = fbCh.id; saveState(); }).catch(() => {});
+    }
+  }
   return ch;
+}
+
+function updateCharacter(bookId, charId, data) {
+  const ch = (state.characters[bookId] || []).find(c => c.id === charId);
+  if (!ch) return;
+  Object.assign(ch, data);
+  saveState();
+  if (isFB() && ch._firebaseId) FB.updateCharacter(ch._firebaseId, data).catch(() => {});
 }
 
 function deleteCharacter(bookId, charId) {
   const ch = (state.characters[bookId] || []).find(c => c.id === charId);
+  if (isFB() && ch && ch._firebaseId) FB.deleteCharacter(ch._firebaseId).catch(() => {});
   state.characters[bookId] = (state.characters[bookId] || []).filter(c => c.id !== charId);
   saveState();
-  syncDeleteCharacter(ch && ch.serverId ? ch.serverId : charId);
 }
 
 function toggleFavorite(bookId) {
@@ -597,57 +629,51 @@ function toggleFavorite(bookId) {
     if (book) book.favorites = (book.favorites || 0) + 1;
   }
   saveState();
-  syncToggleFavorite(bookId);
+  if (isFB()) FB.toggleFavorite(firebaseUserId, bookId).catch(() => {});
 }
 
 function giveFlames(bookId) {
   const book = getBook(bookId);
   if (!book || book.author === state.user.username) return false;
 
-  // Try server first
-  if (serverOnline) {
-    syncGiveFlame(bookId).then(res => {
-      if (res) {
-        state.flamesRemaining = res.remaining;
-        book.flames = res.bookFlames;
-        if (res.expReward) applyExpReward(res.expReward);
-        saveState();
-        render();
+  // Firestore-first
+  if (isFB()) {
+    FB.giveFlame(bookId, firebaseUserId).then(result => {
+      if (result && !result.error) {
+        state.flamesRemaining = result.remaining;
+        book.flames = result.bookFlames;
+        if (result.expGained) { applyExpReward(result.expGained); }
+        state.achievementStats.flamesGiven = (state.achievementStats.flamesGiven || 0) + 1;
+        saveState(); render(); checkAchievements();
       }
-    });
+    }).catch(() => {});
     return true;
   }
 
-  // Fallback localStorage
+  // localStorage fallback
   const todayStr = new Date().toDateString();
-  if (state.flameDate !== todayStr) {
-    state.flameDate = todayStr;
-    state.flamesGiven = 0;
-  }
-
+  if (state.flameDate !== todayStr) { state.flameDate = todayStr; state.flamesGiven = 0; }
   const level = state.user.level || 1;
   const maxFlames = dailyFlameAllowance(level);
   const remaining = Math.max(0, maxFlames - state.flamesGiven);
   if (remaining <= 0) return false;
-
   if (!state.flames[bookId]) state.flames[bookId] = 0;
-  state.flames[bookId] += remaining;
-  book.flames = (book.flames || 0) + remaining;
-  state.flamesGiven += remaining;
-  gainExp(remaining * 10, 'flame');
+  const isFirstToday = state.flamesGiven === 0;
+  state.flames[bookId] += 1; book.flames = (book.flames || 0) + 1;
+  state.flamesGiven += 1; gainExp(10 + (isFirstToday ? 10 : 0), 'flame');
   saveState();
   return true;
 }
 
-function recordView(bookId) {
+function recordView(bookId, chapterId) {
   const book = getBook(bookId);
   if (!book) return;
   book.views = (book.views || 0) + 1;
   const d = new Date().toISOString().split('T')[0];
   if (!book.dailyViews) book.dailyViews = {};
   book.dailyViews[d] = (book.dailyViews[d] || 0) + 1;
+  if (isFB() && book._firebaseId) FB.recordView(book._firebaseId, firebaseUserId, chapterId).catch(() => {});
   saveState();
-  syncRecordView(bookId);
 }
 
 // ---- Review CRUD ----
@@ -659,17 +685,12 @@ function createReview(bookId, data) {
   reviews.push(r);
   state.reviews[bookId] = reviews;
   saveState();
-  if (serverOnline) {
-    syncCreateReview(bookId, data).then(res => {
-      if (!res) return;
-      Object.assign(r, res);
-      if (res.expReward) applyExpReward(res.expReward);
-      saveState();
-      render();
-    });
-  } else {
-    gainExp(20, 'review');
+  gainExp(20, 'review');
+  state.achievementStats.reviews = (state.achievementStats.reviews || 0) + 1;
+  if (isFB()) {
+    FB.createReview(bookId, firebaseUserId, { content: data.content }).then(fbR => { r._firebaseId = fbR.id; saveState(); }).catch(() => {});
   }
+  checkAchievements();
   return r;
 }
 
@@ -683,9 +704,10 @@ function updateReview(bookId, reviewId, data) {
 }
 
 function deleteReview(bookId, reviewId) {
+  const r = getReviews(bookId).find(x => x.id === reviewId);
+  if (isFB() && r && r._firebaseId) FB.deleteReview(r._firebaseId).catch(() => {});
   state.reviews[bookId] = getReviews(bookId).filter(x => x.id !== reviewId);
   saveState();
-  syncDeleteReview(reviewId);
 }
 
 function togglePinReview(bookId, reviewId) {
@@ -694,8 +716,8 @@ function togglePinReview(bookId, reviewId) {
   if (!r) return;
   r.pinned = !r.pinned;
   state.reviews[bookId] = reviews;
+  if (isFB() && r._firebaseId) FB.togglePinReview(r._firebaseId, bookId).catch(() => {});
   saveState();
-  syncTogglePinReview(reviewId);
 }
 
 function toggleFavoriteReview(bookId, reviewId) {
@@ -704,8 +726,8 @@ function toggleFavoriteReview(bookId, reviewId) {
   if (!r) return;
   r.favorited = !r.favorited;
   state.reviews[bookId] = reviews;
+  if (isFB() && r._firebaseId) FB.likeReview(r._firebaseId, firebaseUserId).catch(() => {});
   saveState();
-  syncToggleFavoriteReview(reviewId);
 }
 
 function replyToReview(bookId, reviewId, content) {
@@ -723,50 +745,45 @@ function getChapterComments(bookId, chapterId) {
   const key = bookId + '_' + chapterId;
   return state.chapterComments[key] || [];
 }
+
 function createChapterComment(bookId, chapterId, content) {
   const key = bookId + '_' + chapterId;
   if (!state.chapterComments[key]) state.chapterComments[key] = [];
   const c = { id: genId(), username: state.user.username, content, createdAt: new Date().toLocaleDateString() };
   state.chapterComments[key].push(c);
   saveState();
-  if (serverOnline) {
-    syncCreateComment(chapterId, content).then(res => {
-      if (!res) return;
-      Object.assign(c, res);
-      if (res.expReward) applyExpReward(res.expReward);
-      saveState();
-      render();
-    });
-  } else {
-    gainExp(10, 'comment');
+  gainExp(10, 'comment');
+  state.achievementStats.comments = (state.achievementStats.comments || 0) + 1;
+  if (isFB()) {
+    const ch = (state.chapters[bookId] || []).find(c => c.id === chapterId);
+    if (ch && ch._firebaseId) FB.createComment(ch._firebaseId, firebaseUserId, content).then(fbC => { c._firebaseId = fbC.id; saveState(); }).catch(() => {});
   }
+  checkAchievements();
   return c;
 }
+
 function deleteChapterComment(bookId, chapterId, commentId) {
   const key = bookId + '_' + chapterId;
-  state.chapterComments[key] = (state.chapterComments[key] || []).filter(c => c.id !== commentId);
+  const c = (state.chapterComments[key] || []).find(x => x.id === commentId);
+  if (isFB() && c && c._firebaseId) FB.deleteComment(c._firebaseId).catch(() => {});
+  state.chapterComments[key] = (state.chapterComments[key] || []).filter(x => x.id !== commentId);
   saveState();
-  syncDeleteComment(commentId);
 }
 
 function giveSingleFlame(bookId) {
   const book = getBook(bookId);
   if (!book || book.author === state.user.username) return false;
 
-  if (serverOnline) {
-    const ch = state.chapters[bookId];
-    const chId = ch && ch.length ? ch[ch.length-1].id : '';
-    const endpoint = chId ? syncGiveSingleFlame(chId) : syncGiveFlame(bookId);
-    endpoint.then(res => {
-      if (!res) return;
-      state.flamesRemaining = res.remaining;
-      book.flames = res.bookFlames;
-      if (res.expReward) applyExpReward(res.expReward);
-      saveState();
-      render();
-    });
+  if (isFB()) {
+    const chList = state.chapters[bookId];
+    const chId = chList && chList.length ? (chList[chList.length-1]._firebaseId || chList[chList.length-1].id) : '';
+    const promise = chId ? FB.giveSingleFlame(chId, firebaseUserId) : FB.giveFlame(bookId, firebaseUserId);
+    promise.then(result => {
+      if (result && !result.error) { state.flamesRemaining = result.remaining; book.flames = result.bookFlames; if (result.expGained) applyExpReward(result.expGained); saveState(); render(); }
+    }).catch(() => {});
     return true;
   }
+
 
   const todayStr = new Date().toDateString();
   if (state.flameDate !== todayStr) { state.flameDate = todayStr; state.flamesGiven = 0; }
@@ -774,12 +791,55 @@ function giveSingleFlame(bookId) {
   const maxFlames = dailyFlameAllowance(level);
   if (state.flamesGiven >= maxFlames) return false;
   if (!state.flames[bookId]) state.flames[bookId] = 0;
-  state.flames[bookId] += 1;
-  book.flames = (book.flames || 0) + 1;
-  state.flamesGiven += 1;
-  gainExp(10, 'flame');
+  state.flames[bookId] += 1; book.flames = (book.flames || 0) + 1;
+  state.flamesGiven += 1; gainExp(10, 'flame');
   saveState();
   return true;
+}
+
+// ── Image Upload ──────────────────────────────────
+async function uploadImageToFirebase(file, path) {
+  if (!isFB()) throw new Error('Firebase not available');
+  if (!file || !file.type.startsWith('image/')) throw new Error('Not an image');
+  const maxSize = 5 * 1024 * 1024;
+  if (file.size > maxSize) throw new Error('Image too large (max 5MB)');
+  return await FB.uploadImage(file, path);
+}
+
+async function uploadProfilePic(file) {
+  const url = await uploadImageToFirebase(file, `users/${firebaseUserId}/avatar`);
+  FB.updateProfile(firebaseUserId, { avatar: url }).catch(() => {});
+  state.user.avatar = url;
+  saveState();
+  return url;
+}
+
+async function uploadBanner(file) {
+  const url = await uploadImageToFirebase(file, `users/${firebaseUserId}/banner`);
+  FB.updateProfile(firebaseUserId, { banner: url }).catch(() => {});
+  state.user.banner = url;
+  saveState();
+  return url;
+}
+
+async function uploadBookCover(file, bookId) {
+  const book = getBook(bookId);
+  if (!book) throw new Error('Book not found');
+  const url = await uploadImageToFirebase(file, `books/${book._firebaseId || book.id}/cover`);
+  book.cover = url;
+  if (isFB() && book._firebaseId) FB.updateBook(book._firebaseId, { cover: url }).catch(() => {});
+  saveState();
+  return url;
+}
+
+async function uploadCharacterImage(file, bookId, charId) {
+  const ch = (state.characters[bookId] || []).find(c => c.id === charId);
+  if (!ch) throw new Error('Character not found');
+  const url = await uploadImageToFirebase(file, `characters/${ch._firebaseId || charId}/portrait`);
+  ch.image = url;
+  if (isFB() && ch._firebaseId) FB.updateCharacter(ch._firebaseId, { portrait: url }).catch(() => {});
+  saveState();
+  return url;
 }
 
 // ============================================================
@@ -1438,8 +1498,26 @@ let expGenre = null, expRankTab = 'Popular';
 function renderExplore(type) {
   const books = state.books.filter(b => b.type === type && isPublicBook(b));
   const filtered = expGenre ? books.filter(b => b.genre === expGenre) : books;
-  const rankTabs = ['Popular','New'];
-  const sorted = [...books].sort((a,b) => expRankTab === 'New' ? new Date(b.createdAt) - new Date(a.createdAt) : b.flames - a.flames).slice(0, 30);
+  const rankTabs = ['Daily','Weekly','Monthly','All-Time'];
+  const now = new Date();
+  const sorted = [...books].sort((a,b) => {
+    if (expRankTab === 'Daily') {
+      const aOk = a.updatedAt && now - new Date(a.updatedAt) < 864e5;
+      const bOk = b.updatedAt && now - new Date(b.updatedAt) < 864e5;
+      return aOk && bOk ? b.flames - a.flames : aOk ? -1 : bOk ? 1 : 0;
+    }
+    if (expRankTab === 'Weekly') {
+      const aOk = a.updatedAt && now - new Date(a.updatedAt) < 6048e5;
+      const bOk = b.updatedAt && now - new Date(b.updatedAt) < 6048e5;
+      return aOk && bOk ? b.flames - a.flames : aOk ? -1 : bOk ? 1 : 0;
+    }
+    if (expRankTab === 'Monthly') {
+      const aOk = a.updatedAt && now - new Date(a.updatedAt) < 2592e6;
+      const bOk = b.updatedAt && now - new Date(b.updatedAt) < 2592e6;
+      return aOk && bOk ? b.flames - a.flames : aOk ? -1 : bOk ? 1 : 0;
+    }
+    return b.flames - a.flames;
+  }).slice(0, 30);
 
   return `
     <div class="page">
@@ -1489,16 +1567,7 @@ function renderProfile() {
   const expPct = Math.min(100, Math.round((exp / expToNext) * 100));
 
   // Achievements
-  const achievements = [];
-  if (myBooks.length >= 1) achievements.push({ icon: 'Icons/book.png', label: 'First Book' });
-  if (myBooks.length >= 3) achievements.push({ icon: 'Icons/books-stack-of-three.png', label: '3 Books' });
-  if (myBooks.length >= 5) achievements.push({ icon: 'Icons/books-stack-of-three.png', label: '5 Books' });
-  if (totalViews >= 100) achievements.push({ icon: 'Icons/view.png', label: '100 Views' });
-  if (totalViews >= 1000) achievements.push({ icon: 'Icons/view.png', label: '1K Views' });
-  if (totalViews >= 100000) achievements.push({ icon: 'Icons/view.png', label: '100K Views' });
-  if (totalFlames >= 1) achievements.push({ icon: 'Icons/fire.png', label: 'First Flame' });
-  if (totalFlames >= 100) achievements.push({ icon: 'Icons/fire-flame.png', label: '100 Flames' });
-  if (compBooks >= 1) achievements.push({ icon: 'Icons/icons8-check-mark-50.png', label: 'Completed Work' });
+  const achievements = Object.values(state.achievements || {}).map(a => ({ icon: a.icon, label: a.label }));
 
   // Recently Read - last 3 books with progress
   const recentlyRead = myBooks.filter(b => b.lastReadAt).sort((a, b) => (b.lastReadAt || 0) - (a.lastReadAt || 0)).slice(0, 3);
@@ -1723,7 +1792,6 @@ function renderEditProfile() {
 
 // ---- Author Profile (Creator Hub - Public) ----
 let authorTab = 'Overview';
-const ACHIEVEMENT_THRESHOLDS = [100000, 500000, 1000000];
 const FLAME_MILESTONES = [1000, 5000, 10000, 50000, 100000];
 
 function renderAuthorProfile() {
@@ -1740,15 +1808,7 @@ function renderAuthorProfile() {
   const topSupporters = [...supporters].sort((a,b) => b.amount - a.amount).slice(0, 20);
   const totalFans = new Set(supporters.map(s => s.user)).size;
 
-  const achievements = [];
-  if (allBooks.length >= 1) achievements.push('First Book');
-  if (allBooks.length >= 3) achievements.push('3 Books');
-  if (allBooks.length >= 5) achievements.push('5 Books');
-  ACHIEVEMENT_THRESHOLDS.forEach(t => {
-    if (totalViews >= t) achievements.push(fmt(t) + ' Views');
-  });
-  const topAuthors = [...allBooks].sort((a,b) => b.flames - a.flames).slice(0, 3);
-  if (topAuthors.length > 0 && topAuthors[0].flames > 0) achievements.push('Top Ranked');
+  const achievements = Object.values(state.achievements || {}).map(a => a.label);
 
   const bannerImg = u.banner ? u.banner : '';
   const avatarImg = u.avatar ? u.avatar : '';
@@ -1782,8 +1842,8 @@ function renderAuthorProfile() {
       ${u.bio ? `<p class="author-bio">${u.bio}</p>` : ''}
 
       <div class="author-actions">
-        <button class="btn btn-primary author-follow-btn">+ Follow</button>
-        <button class="btn btn-sm author-support-btn">Support</button>
+        ${firebaseUserId ? `<button class="btn btn-primary author-follow-btn" data-author-id="${u.uid || ''}" ${u.uid === firebaseUserId ? 'disabled style="opacity:0.4"' : ''}>${u.uid === firebaseUserId ? 'Your Profile' : '+ Follow'}</button>` : ''}
+        ${firebaseUserId && u.uid !== firebaseUserId ? `<button class="btn btn-sm author-support-btn">Support</button>` : ''}
       </div>
 
       <div class="author-tabs">
@@ -2044,7 +2104,7 @@ let bookTab = 'Overview';
 function renderBookPage(id) {
   const book = getBook(id);
   if (!book) return '<div class="page"><h2>Book not found</h2></div>';
-  const isAuthor = state.loggedIn && book.author === state.user.username;
+  const isAuthor = state.loggedIn && (book.author === state.user.username || (isFB() && book.author === firebaseUserId));
   if (!isAuthor && !isPublicBook(book)) return '<div class="page"><h2>Book not found</h2></div>';
 
   recordView(id);
@@ -2083,14 +2143,18 @@ function renderBookPage(id) {
           <div class="book-identity-actions">
             <button class="btn btn-sm book-fav" data-book="${id}" style="background:${isFav?'rgba(255,255,255,0.15)':'var(--bg-hover)'}">${isFav?'Favorited':'Favorite'}</button>
             ${chapters.length ? `<a class="btn btn-primary" href="#/book/${id}/read/${chapters[0].id}" style="text-decoration:none">Start Reading</a>` : ''}
-            ${state.loggedIn && !isAuthor ? (() => {
+          </div>
+          ${state.loggedIn && !isAuthor ? (() => {
   const td = new Date().toDateString();
   const lv = state.user.level || 1;
   const maxF = dailyFlameAllowance(lv);
   const rem = serverOnline ? (state.flamesRemaining ?? maxF) : Math.max(0, maxF - (state.flameDate === td ? state.flamesGiven : 0));
-  return `<button class="btn btn-flame book-flame" data-book="${id}" style="padding:5px 10px">${rem > 0 ? 'Give ' + rem + ' Flame' + (rem > 1 ? 's' : '') : 'Given'}</button>`;
+  return `<div class="book-support-section">
+    <div class="book-support-flames"><img src="Icons/fire-flame.png" width="18" style="vertical-align:middle;margin-right:6px"><strong>${fmt(book.flames)}</strong> Flames</div>
+    <div class="book-support-remaining">Daily Remaining: <strong>${rem}</strong></div>
+    <button class="btn btn-flame book-flame" data-book="${id}" ${rem <= 0 ? 'disabled' : ''} style="${rem <= 0 ? 'opacity:0.4;cursor:default' : ''}">${rem <= 0 ? 'No Flames Remaining Today' : '<img src="Icons/fire.png" width="14" style="vertical-align:middle;margin-right:4px">Support'}</button>
+  </div>`;
 })() : ''}
-          </div>
         </div>
       </div>
 
@@ -2241,7 +2305,7 @@ function renderBookPage(id) {
 function renderChapterReader(bookId, chapterId) {
   const book = getBook(bookId);
   if (!book) return '<div class="page"><h2>Book not found</h2></div>';
-  const isAuthor = state.loggedIn && book.author === state.user.username;
+  const isAuthor = state.loggedIn && (book.author === state.user.username || (isFB() && book.author === firebaseUserId));
   if (!isAuthor && !isPublicBook(book)) return '<div class="page"><h2>Book not found</h2></div>';
   const chapters = state.chapters[bookId] || [];
   const ch = chapters.find(c => c.id === chapterId);
@@ -2263,14 +2327,17 @@ function renderChapterReader(bookId, chapterId) {
       state.readingProgress.push({ book_id: bookId, chapter_id: chapterId, completion_pct: completion, last_read_at: new Date().toISOString() });
     }
     saveState();
-    syncUpdateProgress(bookId, { chapter_id: chapterId, completion_pct: completion });
+    if (isFB() && firebaseUserId) FB.updateReadingProgress(firebaseUserId, bookId, { chapterId, completionPct: completion }).catch(() => {});
     // Award EXP for reading (once per chapter session)
     if (!state._readExpCache) state._readExpCache = {};
     if (!state._readExpCache[chapterId]) {
       state._readExpCache[chapterId] = true;
       gainExp(5, 'read');
+      state.achievementStats.chaptersRead = (state.achievementStats.chaptersRead || 0) + 1;
     }
   }
+
+  recordView(bookId, chapterId);
 
   const idx = chapters.indexOf(ch);
   const prevCh = idx > 0 ? chapters[idx - 1] : null;
@@ -2306,45 +2373,30 @@ function renderChapterReader(bookId, chapterId) {
       <div class="end-section">
 
         <!-- Chapter Complete Card -->
-        <div class="end-card">
-          <div class="end-card-label">Chapter Complete</div>
-          <p class="end-card-sub">Enjoyed this chapter? Support the author!</p>
+        <div class="end-card end-card-complete">
+          <div class="end-divider">━━━━━━━━━━━━━━━━━━</div>
+          <div class="end-card-label" style="font-size:1.2rem;margin:10px 0 4px">Chapter Complete</div>
+          <div class="end-divider">━━━━━━━━━━━━━━━━━━</div>
         </div>
 
         <!-- Flame Section -->
-        ${state.loggedIn && !isAuthor ? `<div class="end-card">
-          <div class="end-card-label"><img src="Icons/flames.png" width="16" style="vertical-align:middle;margin-right:6px">Support Author</div>
-          <div class="end-flame-info">Available Today: <strong>${rem}</strong> / ${maxF}</div>
-          <button class="btn btn-primary rd-give-flame" data-book="${bookId}" ${rem <= 0 ? 'disabled' : ''} style="${rem <= 0 ? 'opacity:0.4;cursor:default' : ''}"><img src="Icons/fire.png" width="14" style="vertical-align:middle;margin-right:4px">Give Flame</button>
-          <div class="flame-feedback" id="flame-feedback" style="display:none"><img src="Icons/fire-flame.png" width="14" style="vertical-align:middle;margin-right:4px">+1 Flame Sent</div>
-          <div class="end-flame-rules">
-            <span>Lv 1-4: 2/day</span>
-            <span>Lv 5-10: 3/day</span>
-            <span>Lv 11-20: 4/day</span>
-            <span>Lv 21+: 5/day</span>
-          </div>
+        ${state.loggedIn && !isAuthor ? `<div class="end-card end-card-flame">
+          <div class="end-flame-title"><img src="Icons/fire-flame.png" width="22" style="vertical-align:middle;margin-right:8px">Support This Story</div>
+          <div class="end-flame-info">Daily Flames Remaining: <strong>${rem}</strong></div>
+          <button class="btn btn-primary btn-flame-give" data-book="${bookId}" ${rem <= 0 ? 'disabled' : ''} style="${rem <= 0 ? 'opacity:0.4;cursor:default;font-size:0.75rem' : 'font-size:0.75rem'}">${rem <= 0 ? 'No Flames Remaining Today' : '<img src="Icons/fire.png" width="16" style="vertical-align:middle;margin-right:6px">Give Flame'}</button>
+          <div class="flame-feedback" id="flame-feedback" style="display:none;margin-top:8px;font-size:0.7rem;color:var(--accent)"><img src="Icons/fire-flame.png" width="14" style="vertical-align:middle;margin-right:4px">Flame Sent — <span id="flame-remaining-text">${rem - 1}</span> remaining today</div>
         </div>` : ''}
 
-        <!-- EXP Bar -->
-        ${state.loggedIn ? `<div class="end-card">
-          <div class="end-exp-header">
-            <span class="end-exp-level">Level ${userLvl}</span>
-            <span class="end-exp-numbers">${userExp} / ${expNeeded} EXP</span>
-          </div>
-          <div class="end-exp-bar">
-            <div class="end-exp-fill" style="width:${expPct}%"></div>
-          </div>
-        </div>` : ''}
-
-        <!-- Comments Section -->
+        <!-- Chapter Discussion -->
         <div class="end-card">
-          <div class="end-card-label"><img src="Icons/inbox.png" width="14" style="vertical-align:middle;margin-right:6px">Chapter Discussion</div>
+          <div class="end-card-label" style="font-size:0.9rem"><img src="Icons/inbox.png" width="16" style="vertical-align:middle;margin-right:6px">Chapter Discussion</div>
           ${state.loggedIn ? `
           <form class="ch-comment-form" data-book="${bookId}" data-chapter="${chapterId}" style="margin-bottom:10px">
             <textarea class="input-field" name="content" placeholder="Comment on this chapter..." rows="2" style="margin-bottom:6px"></textarea>
-            <button type="submit" class="btn btn-primary" style="font-size:0.65rem;padding:5px 12px">Post Comment</button>
-          </form>` : `<p class="end-comment-login" style="font-size:0.65rem;color:var(--text3);margin-bottom:10px"><a href="#/signin" style="color:var(--accent)">Sign in</a> to comment</p>`}
-          <div class="ch-comments">
+            <button type="submit" class="btn btn-sm btn-primary">Post Comment</button>
+          </form>` : `<p style="font-size:0.65rem;color:var(--text3);margin-bottom:10px"><a href="#/signin" style="color:var(--accent)">Sign in</a> to comment</p>`}
+          <button class="btn btn-sm rd-view-comments" data-book="${bookId}" data-chapter="${chapterId}" style="margin-bottom:10px">${chComments.length ? `View Comments (${chComments.length})` : 'No comments yet'}</button>
+          <div class="ch-comments" id="ch-comments-${chapterId}" style="display:none">
             ${chComments.length ? chComments.map(c => `
             <div class="ch-comment-item">
               <span class="ch-comment-avatar">${c.username[0]}</span>
@@ -2355,15 +2407,15 @@ function renderChapterReader(bookId, chapterId) {
               </div>
               ${state.loggedIn && (c.username === state.user.username || book.author === state.user.username) ? `<button class="btn btn-sm ch-comment-del" data-book="${bookId}" data-chapter="${chapterId}" data-comment="${c.id}" style="font-size:0.5rem;padding:2px 6px;color:var(--red);flex-shrink:0">x</button>` : ''}
             </div>
-            `).join('') : '<p style="font-size:0.65rem;color:var(--text3);text-align:center;padding:8px 0">No comments yet</p>'}
+            `).join('') : ''}
           </div>
         </div>
 
         <!-- Navigation -->
         <div class="end-nav">
-          ${prevCh ? `<a class="btn btn-sm" href="#/book/${bookId}/read/${prevCh.id}"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Previous</a>` : '<span></span>'}
-          <button class="btn btn-sm rd-chapter-list" data-book="${bookId}"><img src="Icons/books-stack-of-three.png" width="12" style="vertical-align:middle;margin-right:4px">Chapters</button>
-          ${nextCh ? `<a class="btn btn-primary" href="#/book/${bookId}/read/${nextCh.id}">Next <img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-left:4px"></a>` : `<a class="btn btn-sm" href="#/book/${bookId}"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back to Book</a>`}
+          ${prevCh ? `<a class="btn btn-sm" href="#/book/${bookId}/read/${prevCh.id}"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Previous Chapter</a>` : '<span></span>'}
+          <button class="btn btn-sm rd-chapter-list" data-book="${bookId}"><img src="Icons/books-stack-of-three.png" width="12" style="vertical-align:middle;margin-right:4px">Chapter List</button>
+          ${nextCh ? `<a class="btn btn-primary" href="#/book/${bookId}/read/${nextCh.id}">Next Chapter <img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-left:4px"></a>` : `<a class="btn btn-sm" href="#/book/${bookId}"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back to Book</a>`}
         </div>
 
       </div>
@@ -2453,7 +2505,10 @@ function bindPageEvents(route) {
       const bookId = charForm.dataset.book;
       const data = { name: fd.get('name'), role: fd.get('role'), description: fd.get('description'), image: preview ? preview.dataset.image || '' : '' };
       if (!data.name.trim()) return;
-      createCharacter(bookId, data);
+      const ch = createCharacter(bookId, data);
+      if (isFB() && ch && preview && preview.dataset.image && preview.dataset.image.startsWith('data:') && fileInput && fileInput.files[0]) {
+        uploadCharacterImage(fileInput.files[0], bookId, ch.id).then(() => render()).catch(() => {});
+      }
       navigate('#/write/works/' + bookId);
     });
   }
@@ -2572,8 +2627,10 @@ function bindPageEvents(route) {
       body.innerHTML = '<p style="font-size:0.65rem;color:var(--text3);padding:16px;text-align:center">Loading...</p>';
 
       let revisions = [];
-      if (serverOnline) {
-        const res = await syncGetRevisions(chId);
+      if (isFB()) {
+        const ch = (state.chapters[id] || []).find(c => c.id === chId);
+        const fbChId = ch?._firebaseId || chId;
+        const res = await FB.getRevisions(fbChId);
         if (res) revisions = res;
       }
       if (!revisions.length) {
@@ -2606,8 +2663,9 @@ function bindPageEvents(route) {
     if (!previewArea) return;
     previewArea.style.display = 'block';
 
-    if (serverOnline) {
-      syncGetRevision(chId, revId).then(rev => {
+    if (isFB()) {
+      const fbChId = chId; // chId is already the _firebaseId or local id
+      FB.getRevision(revId).then(rev => {
         if (rev) {
           previewTitle.textContent = rev.title || 'Untitled';
           previewContent.textContent = (rev.content || '').slice(0, 500) + ((rev.content || '').length > 500 ? '...' : '');
@@ -2625,16 +2683,19 @@ function bindPageEvents(route) {
     const revId = btn.dataset.revId;
     const chId = btn.dataset.chId;
     if (!confirm('Restore this version? Current changes will be saved as a new revision.')) return;
-    if (serverOnline) {
-      syncRestoreRevision(chId, revId).then(chapter => {
-        if (chapter) {
-          document.getElementById('editor-title').value = chapter.title;
-          document.getElementById('editor-content').value = chapter.content;
+    if (isFB()) {
+      FB.getRevision(revId).then(rev => {
+        if (rev) {
+          document.getElementById('editor-title').value = rev.title || '';
+          document.getElementById('editor-content').value = rev.content || '';
           const modal = document.getElementById('rev-modal');
           if (modal) modal.style.display = 'none';
           const status = document.getElementById('editor-autosave-status');
           if (status) status.textContent = 'Version restored';
-          updateChapter(document.querySelector('.ed-save')?.dataset?.book, chId, { title: chapter.title, content: chapter.content });
+          updateChapter(document.querySelector('.ed-save')?.dataset?.book, chId, { title: rev.title || '', content: rev.content || '' });
+          const ch = (state.chapters[document.querySelector('.ed-save')?.dataset?.book] || []).find(c => c.id === chId);
+          const fbChId = ch?._firebaseId || chId;
+          FB.restoreRevision(fbChId, revId).catch(() => {});
         }
       });
     }
@@ -2686,9 +2747,8 @@ function bindPageEvents(route) {
       input.addEventListener('change', function() {
         const f = this.files[0];
         if (!f) return;
-        const r = new FileReader();
-        r.onload = e => { updateBook(bookId, { cover: e.target.result }); render(); };
-        r.readAsDataURL(f);
+        if (isFB()) { uploadBookCover(f, bookId).then(() => render()).catch(() => { const r = new FileReader(); r.onload = e => { updateBook(bookId, { cover: e.target.result }); render(); }; r.readAsDataURL(f); }); }
+        else { const r = new FileReader(); r.onload = e => { updateBook(bookId, { cover: e.target.result }); render(); }; r.readAsDataURL(f); }
       });
       input.click();
     });
@@ -2703,9 +2763,8 @@ function bindPageEvents(route) {
       const route = getRoute();
       const parts = route.split('/');
       const id = parts[3] || parts[2];
-      const r = new FileReader();
-      r.onload = e => { updateBook(id, { cover: e.target.result }); render(); };
-      r.readAsDataURL(f);
+      if (isFB()) { uploadBookCover(f, id).then(() => render()).catch(() => { const r = new FileReader(); r.onload = e => { updateBook(id, { cover: e.target.result }); render(); }; r.readAsDataURL(f); }); }
+      else { const r = new FileReader(); r.onload = e => { updateBook(id, { cover: e.target.result }); render(); }; r.readAsDataURL(f); }
     });
   }
 
@@ -2802,6 +2861,7 @@ function bindPageEvents(route) {
     el.addEventListener('click', () => {
       if (giveFlames(el.dataset.book)) {
         saveState();
+        showToast('🔥 Flame Sent');
         render();
       }
     });
@@ -2809,7 +2869,12 @@ function bindPageEvents(route) {
 
   // ---- Theme selection ----
   document.querySelectorAll('[data-theme-btn]').forEach(el => {
-    el.addEventListener('click', () => { state.theme = el.dataset.themeBtn; saveState(); render(); });
+    el.addEventListener('click', () => {
+      state.theme = el.dataset.themeBtn;
+      saveState();
+      if (firebaseUserId && FB.isFirebaseReady && FB.isFirebaseReady()) FB.updateSettings(firebaseUserId, { theme: state.theme });
+      render();
+    });
   });
 
   // ---- Author tabs ----
@@ -2876,24 +2941,42 @@ function bindPageEvents(route) {
 
   // ---- Follow author ----
   document.querySelectorAll('.author-follow-btn').forEach(el => {
-    el.addEventListener('click', () => {
-      state.user.followers += 1;
-      saveState();
-      render();
+    el.addEventListener('click', function() {
+      const authorId = el.dataset.authorId;
+      if (firebaseUserId && authorId && FB.isFirebaseReady && FB.isFirebaseReady()) {
+        FB.toggleFollow(firebaseUserId, authorId).then(result => {
+          if (result && !result.error) {
+            state.user.followers += result.following ? 1 : -1;
+            el.textContent = result.following ? 'Following' : '+ Follow';
+            saveState();
+            render();
+          }
+        }).catch(() => {});
+      } else {
+        // Toggle local fallback
+        const isFollowing = el.textContent === 'Following';
+        if (isFollowing) {
+          state.user.followers = Math.max(0, (state.user.followers || 0) - 1);
+          el.textContent = '+ Follow';
+        } else {
+          state.user.followers = (state.user.followers || 0) + 1;
+          el.textContent = 'Following';
+        }
+        saveState();
+        render();
+      }
     });
   });
 
   // ---- Support author ----
   document.querySelectorAll('.author-support-btn').forEach(el => {
     el.addEventListener('click', () => {
-      const amount = prompt('Enter flame amount to send:', '10');
-      if (!amount) return;
-      const num = parseInt(amount);
-      if (isNaN(num) || num <= 0) return;
-      const giver = state.user.username;
-      state.supporterHistory.push({ user: giver, amount: num, date: new Date().toISOString() });
-      saveState();
-      render();
+      if (!state.books.length) return;
+      const book = state.books.find(b => b.author === state.user.username) || state.books[0];
+      if (book && giveFlames(book.id)) {
+        saveState();
+        render();
+      }
     });
   });
 
@@ -2907,7 +2990,42 @@ function bindPageEvents(route) {
       const password = fd.get('password').trim();
       const err = document.getElementById('signin-error');
 
-      // Try backend first
+      // Try Firebase first
+      if (FB.isFirebaseReady && FB.isFirebaseReady()) {
+        try {
+          const user = await FB.signInWithEmail(email, password);
+          if (user) {
+            firebaseUserId = user.uid;
+            state.loggedIn = true;
+            state.user.email = email;
+            state.user.username = user.displayName || email;
+            const fbUser = await FB.getUser(user.uid);
+            if (fbUser) {
+              state.user.level = fbUser.level || 1;
+              state.user.exp = fbUser.exp || 0;
+              state.user.lifetime_exp = fbUser.lifetimeExp || 0;
+              state.user.bio = fbUser.bio || '';
+              state.user.avatar = fbUser.avatar || '';
+              state.user.banner = fbUser.banner || '';
+              state.user.followers = fbUser.followers || 0;
+              state.flameAllowance = dailyFlameAllowance(fbUser.level || 1);
+              state.flamesRemaining = fbUser.dailyFlamesRemaining || 0;
+            }
+            await loadAllFirestoreData();
+            await migrateLocalData();
+            FB.checkDailyReset(firebaseUserId).then(remaining => { if (remaining != null) state.flamesRemaining = remaining; saveState(); render(); }).catch(() => {});
+            saveState();
+            navigate('#/');
+            return;
+          }
+        } catch (e) {
+          err.textContent = e.message || 'Login failed';
+          err.style.display = 'block';
+          return;
+        }
+      }
+
+      // Try backend
       const data = await apiFetch('/api/auth/signin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2949,7 +3067,33 @@ function bindPageEvents(route) {
       if (password.length < 4) { err.textContent = 'Password must be at least 4 characters'; err.style.display = 'block'; return; }
       if (password !== confirm) { err.textContent = 'Passwords do not match'; err.style.display = 'block'; return; }
 
-      // Try backend first
+      // Try Firebase first
+      if (FB.isFirebaseReady && FB.isFirebaseReady()) {
+        try {
+          const user = await FB.signUpWithEmail(email, password, username);
+          if (user) {
+            firebaseUserId = user.uid;
+            state.loggedIn = true;
+            state.user.email = email;
+            state.user.username = username;
+            state.flameAllowance = dailyFlameAllowance(1);
+            state.flamesRemaining = state.flameAllowance;
+            saveState();
+            navigate('#/');
+            return;
+          }
+        } catch (e) {
+          if (e.code === 'auth/email-already-in-use') {
+            err.textContent = 'An account with this email already exists';
+          } else {
+            err.textContent = e.message || 'Signup failed';
+          }
+          err.style.display = 'block';
+          return;
+        }
+      }
+
+      // Try backend
       const data = await apiFetch('/api/auth/signup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2976,6 +3120,9 @@ function bindPageEvents(route) {
   const signOutBtn = document.getElementById('sign-out-btn');
   if (signOutBtn) {
     signOutBtn.addEventListener('click', async () => {
+      if (FB.isFirebaseReady && FB.isFirebaseReady()) {
+        try { await FB.signOut(); } catch (e) {}
+      }
       await apiFetch('/api/auth/signout', { method: 'POST' });
       logoutUser();
       navigate('#/');
@@ -3011,6 +3158,16 @@ function bindPageEvents(route) {
       state.lastDailyClaim = new Date().toDateString();
       state.dailyStreak = (state.dailyStreak || 0) + 1;
       saveState();
+      if (firebaseUserId && FB.isFirebaseReady && FB.isFirebaseReady()) {
+        FB.claimDailyReward(firebaseUserId).then(result => {
+          if (result && result.claimed && result.expGained) gainExp(result.expGained, 'daily');
+          if (result && result.expResult) {
+            state.user.level = result.expResult.level;
+            state.user.exp = result.expResult.exp || 0;
+          }
+          saveState(); render();
+        }).catch(() => {});
+      }
       render();
     });
   }
@@ -3030,14 +3187,8 @@ function bindPageEvents(route) {
     bannerInput.addEventListener('change', function() {
       const file = this.files[0];
       if (!file) return;
-      const reader = new FileReader();
-      reader.onload = e => {
-        state.user.banner = e.target.result;
-        saveState();
-        syncUpdateProfile({ banner: state.user.banner });
-        render();
-      };
-      reader.readAsDataURL(file);
+      if (isFB()) { uploadBanner(file).then(() => render()).catch(() => { const r = new FileReader(); r.onload = e => { state.user.banner = e.target.result; saveState(); render(); }; r.readAsDataURL(file); }); }
+      else { const r = new FileReader(); r.onload = e => { state.user.banner = e.target.result; saveState(); render(); }; r.readAsDataURL(file); }
     });
   }
 
@@ -3047,14 +3198,8 @@ function bindPageEvents(route) {
     avatarInput.addEventListener('change', function() {
       const file = this.files[0];
       if (!file) return;
-      const reader = new FileReader();
-      reader.onload = e => {
-        state.user.avatar = e.target.result;
-        saveState();
-        syncUpdateProfile({ avatar: state.user.avatar });
-        render();
-      };
-      reader.readAsDataURL(file);
+      if (isFB()) { uploadProfilePic(file).then(() => render()).catch(() => { const r = new FileReader(); r.onload = e => { state.user.avatar = e.target.result; saveState(); render(); }; r.readAsDataURL(file); }); }
+      else { const r = new FileReader(); r.onload = e => { state.user.avatar = e.target.result; saveState(); render(); }; r.readAsDataURL(file); }
     });
   }
 
@@ -3064,14 +3209,8 @@ function bindPageEvents(route) {
     editAvatarInput.addEventListener('change', function() {
       const file = this.files[0];
       if (!file) return;
-      const reader = new FileReader();
-      reader.onload = e => {
-        state.user.avatar = e.target.result;
-        saveState();
-        syncUpdateProfile({ avatar: state.user.avatar });
-        render();
-      };
-      reader.readAsDataURL(file);
+      if (isFB()) { uploadProfilePic(file).then(() => render()).catch(() => { const r = new FileReader(); r.onload = e => { state.user.avatar = e.target.result; saveState(); render(); }; r.readAsDataURL(file); }); }
+      else { const r = new FileReader(); r.onload = e => { state.user.avatar = e.target.result; saveState(); render(); }; r.readAsDataURL(file); }
     });
   }
 
@@ -3081,7 +3220,7 @@ function bindPageEvents(route) {
     removeAvatarBtn.addEventListener('click', () => {
       state.user.avatar = '';
       saveState();
-      syncUpdateProfile({ avatar: '' });
+      if (isFB()) FB.updateProfile(firebaseUserId, { avatar: '' }).catch(() => {});
       render();
     });
   }
@@ -3092,14 +3231,8 @@ function bindPageEvents(route) {
     editBannerInput.addEventListener('change', function() {
       const file = this.files[0];
       if (!file) return;
-      const reader = new FileReader();
-      reader.onload = e => {
-        state.user.banner = e.target.result;
-        saveState();
-        syncUpdateProfile({ banner: state.user.banner });
-        render();
-      };
-      reader.readAsDataURL(file);
+      if (isFB()) { uploadBanner(file).then(() => render()).catch(() => { const r = new FileReader(); r.onload = e => { state.user.banner = e.target.result; saveState(); render(); }; r.readAsDataURL(file); }); }
+      else { const r = new FileReader(); r.onload = e => { state.user.banner = e.target.result; saveState(); render(); }; r.readAsDataURL(file); }
     });
   }
 
@@ -3109,7 +3242,7 @@ function bindPageEvents(route) {
     removeBannerBtn.addEventListener('click', () => {
       state.user.banner = '';
       saveState();
-      syncUpdateProfile({ banner: '' });
+      if (isFB()) FB.updateProfile(firebaseUserId, { banner: '' }).catch(() => {});
       render();
     });
   }
@@ -3127,34 +3260,33 @@ function bindPageEvents(route) {
       state.user.twitter = fd.get('twitter').trim() || '';
       state.user.facebook = fd.get('facebook').trim() || '';
       saveState();
-      syncUpdateProfile({ username: state.user.username, bio: state.user.bio, avatar: state.user.avatar || '', banner: state.user.banner || '' });
+      if (isFB()) FB.updateProfile(firebaseUserId, { username: state.user.username, bio: state.user.bio, avatar: state.user.avatar || '', banner: state.user.banner || '' }).catch(() => {});
       navigate('#/profile');
     });
   }
 
   // ---- Reader: Give Flame ----
-  document.querySelectorAll('.rd-give-flame').forEach(el => {
+  document.querySelectorAll('.btn-flame-give').forEach(el => {
     el.addEventListener('click', function() {
       const bookId = this.dataset.book;
       const fb = document.getElementById('flame-feedback');
-      if (serverOnline) {
-        const chs = state.chapters[bookId];
-        const chId = chs && chs.length ? chs[chs.length-1].id : null;
-        const promise = chId ? syncGiveSingleFlame(chId) : syncGiveFlame(bookId);
-        promise.then(res => {
-          if (res) {
+      if (isFB()) {
+        FB.giveFlame(bookId, firebaseUserId).then(res => {
+          if (res && !res.error) {
             const book = getBook(bookId);
             if (book) book.flames = res.bookFlames;
             state.flamesRemaining = res.remaining;
-            if (res.expReward) applyExpReward(res.expReward);
+            if (res.expGained) applyExpReward(res.expGained);
             saveState();
             if (fb) {
+              const remSpan = document.getElementById('flame-remaining-text');
+              if (remSpan) remSpan.textContent = res.remaining;
               fb.style.display = 'block';
               fb.classList.add('flame-anim');
-              setTimeout(() => { fb.classList.remove('flame-anim'); render(); }, 1200);
+              setTimeout(() => { fb.classList.remove('flame-anim'); render(); }, 1500);
             } else { render(); }
           }
-        });
+        }).catch(() => {});
       } else {
         if (giveSingleFlame(bookId)) {
           saveState();
@@ -3162,7 +3294,7 @@ function bindPageEvents(route) {
           if (fb) {
             fb.style.display = 'block';
             fb.classList.add('flame-anim');
-            setTimeout(() => { fb.classList.remove('flame-anim'); render(); }, 1200);
+            setTimeout(() => { fb.classList.remove('flame-anim'); render(); }, 1500);
           } else { render(); }
         }
       }
