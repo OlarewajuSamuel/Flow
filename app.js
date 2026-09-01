@@ -854,14 +854,10 @@ function chapterBlocks(content) {
   return String(content).split(/\r?\n\s*\r?\n/).map(b => b.trim()).filter(Boolean);
 }
 
-// Render a single paragraph with its inline comment marker + passage highlights.
+// Render a single paragraph with passage highlights. No plus markers: readers and
+// authors use text selection to attach comments to passages instead.
 function paragraphHtml(bookId, chapterId, block, paraIdx) {
-  const book = getBook(bookId);
-  const isAuthor = state.loggedIn && !!book && book.author === state.user.username;
-  const marker = isAuthor
-    ? `<span class="para-marker" data-para="${paraIdx}" data-book="${bookId}" data-chapter="${chapterId}" title="Comment on this paragraph">+${getChapterComments(bookId, chapterId).filter(c => c.para === paraIdx).length || ''}</span>`
-    : '';
-  return `<p class="reader-para" data-para="${paraIdx}">${marker}${highlightBlockHtml(bookId, chapterId, block, paraIdx)}</p>`;
+  return `<p class="reader-para" data-para="${paraIdx}">${highlightBlockHtml(bookId, chapterId, block, paraIdx)}</p>`;
 }
 
 // Tokenize a paragraph's raw text the same way renderRichContent does, so we can
@@ -943,6 +939,121 @@ function paginateBlocks(blocks, pageChars) {
   });
   if (cur.length) pages.push(cur);
   return pages.length ? pages : [[]];
+}
+
+// ---- Reader page-by-page helpers (swipe between pages) ----
+const READER_PAGE_CHARS = 1600;
+
+function readerPageNavHtml(idx, total) {
+  return `<div class="reader-page-nav">
+    <button class="btn btn-sm rd-page-prev" ${idx <= 0 ? 'disabled' : ''} style="font-size:0.6rem">&#8249; Prev</button>
+    <span class="reader-page-count">Page ${idx + 1} / ${total}</span>
+    <button class="btn btn-sm rd-page-next" ${idx >= total - 1 ? 'disabled' : ''} style="font-size:0.6rem">Next &#8250;</button>
+  </div>`;
+}
+
+// Build the markup for a single page (nav + paragraphs) by index.
+function readerPageBuild(bookId, chapterId, idx) {
+  const chapters = state.chapters[bookId] || [];
+  const ch = chapters.find(c => c.id === chapterId);
+  if (!ch) return { total: 1, nav: '', body: '' };
+  const pages = paginateBlocks(chapterBlocks(ch.content), READER_PAGE_CHARS);
+  const total = Math.max(1, pages.length);
+  const i = Math.max(0, Math.min(idx || 0, total - 1));
+  let acc = 0;
+  pages.slice(0, i).forEach(p => { acc += p.length; });
+  return {
+    total,
+    nav: readerPageNavHtml(i, total),
+    body: (pages[i] || []).map((b, k) => paragraphHtml(bookId, chapterId, b, acc + k)).join('')
+  };
+}
+
+// Animate the track to the next/prev page, then re-render at the new index.
+function readerTurnPage(dir, pagesEl, track) {
+  const total = parseInt(pagesEl.dataset.total || '1', 10);
+  const bookId = pagesEl.dataset.book;
+  const chapterId = pagesEl.dataset.chapter;
+  const cur = state.readerPageIndex || 0;
+  const next = cur + dir;
+  if (next < 0 || next >= total) {
+    track.style.transition = '';
+    track.style.transform = 'translateX(0px)';
+    return;
+  }
+  if (track.dataset.anim === '1') return;
+  track.dataset.anim = '1';
+  const shift = pagesEl.offsetWidth;
+  const build = readerPageBuild(bookId, chapterId, next);
+  const inc = document.createElement('div');
+  inc.className = 'rp-page';
+  inc.innerHTML = build.nav + build.body;
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    track.removeEventListener('transitionend', finish);
+    state.readerPageIndex = next;
+    saveState();
+    render();
+  };
+  track.addEventListener('transitionend', finish);
+  window.setTimeout(finish, 520);
+  if (dir > 0) {
+    track.appendChild(inc);
+    track.style.transition = 'transform 0.3s cubic-bezier(.22,.61,.36,1)';
+    void track.offsetWidth;
+    track.style.transform = 'translateX(' + (-shift) + 'px)';
+  } else {
+    track.insertBefore(inc, track.firstChild);
+    track.style.transition = 'none';
+    track.style.transform = 'translateX(' + (-shift) + 'px)';
+    void track.offsetWidth;
+    track.style.transition = 'transform 0.3s cubic-bezier(.22,.61,.36,1)';
+    track.style.transform = 'translateX(0px)';
+  }
+}
+
+// Swipe detection (touch + mouse), delegated once on the document.
+function bindReaderSwipe() {
+  if (window._flowSwipeBound) return;
+  window._flowSwipeBound = true;
+  let c = null;
+  const pagesElOf = t => t && t.closest ? t.closest('#reader-pages') : null;
+  document.addEventListener('pointerdown', e => {
+    if (c) return;
+    const p = pagesElOf(e.target);
+    if (!p) return;
+    const track = document.getElementById('rp-track');
+    if (!track || track.dataset.anim === '1') return;
+    if (e.target.closest && e.target.closest('a, button, .btn, mark, .sel-popup, .sel-form, .para-marker')) return;
+    if (e.pointerType === 'touch' && e.touches && e.touches.length > 1) return;
+    c = { p, track, id: e.pointerId, x: e.clientX, y: e.clientY, dx: 0, dy: 0, on: false };
+  }, { passive: true });
+  document.addEventListener('pointermove', e => {
+    if (!c || c.id !== e.pointerId) return;
+    c.dx = e.clientX - c.x;
+    c.dy = e.clientY - c.y;
+    if (!c.on) {
+      if (Math.abs(c.dx) < 10 && Math.abs(c.dy) < 10) return;
+      if (Math.abs(c.dx) <= Math.abs(c.dy)) { c = null; return; }
+      c.on = true;
+      c.track.style.transition = 'none';
+    }
+    const shift = Math.max(-80, Math.min(80, c.dx * 0.4));
+    c.track.style.transform = 'translateX(' + shift + 'px)';
+  }, { passive: true });
+  const endSwipe = e => {
+    if (!c || c.id !== e.pointerId) return;
+    const f = c;
+    c = null;
+    if (!f.on) { f.track.style.transform = 'translateX(0px)'; return; }
+    const dir = f.dx < -40 ? 1 : f.dx > 40 ? -1 : 0;
+    if (!dir) { f.track.style.transform = 'translateX(0px)'; return; }
+    readerTurnPage(dir, f.p, f.track);
+  };
+  document.addEventListener('pointerup', endSwipe);
+  document.addEventListener('pointercancel', endSwipe);
 }
 function bindImageErrorLogging() {
   document.querySelectorAll('[data-img-url]').forEach(el => {
@@ -1444,7 +1555,7 @@ function showSelPop(rect) {
     if (document.body.appendChild) document.body.appendChild(pop);
   }
   if (!pop) return;
-  pop.innerHTML = '<div class="sel-row"><button class="btn btn-sm sel-comment-btn">Comment</button><button class="btn btn-sm sel-cancel" title="Close" style="padding:2px 7px">&#215;</button></div>';
+  pop.innerHTML = '<div class="sel-row"><button class="btn btn-sm sel-comment-btn"><img src="Icons/icons8-comments-50.png" width="13" style="vertical-align:middle;margin-right:4px">Comment</button><button class="btn btn-sm ic-x sel-cancel" title="Close"><img src="Icons/icons8-cancel-24.png" alt="Close"></button></div>';
   pop.style.display = 'flex';
   const pw = pop.offsetWidth || 150;
   const ph = pop.offsetHeight || 34;
@@ -1460,7 +1571,7 @@ function showSelPop(rect) {
 function hideSelPop() {
   if (typeof document === 'undefined') return;
   const pop = document.getElementById('sel-popup');
-  if (pop) pop.style.display = 'none';
+  if (pop) { pop.style.display = 'none'; pop.classList.remove('open-form'); }
 }
 
 function selOpenForm() {
@@ -1468,13 +1579,14 @@ function selOpenForm() {
   if (!pop || !_sel) return;
   if (!state.loggedIn) { hideSelPop(); clearSelection(); navigate('#/signin'); return; }
   pop.style.width = '260px';
+  pop.classList.add('open-form');
   pop.innerHTML = `
     <form class="sel-form">
       <div class="sel-quote">&#8220;${escHtml(_sel.text)}&#8221;</div>
       <textarea class="input-field" name="content" rows="2" placeholder="Comment on this passage..." style="font-size:0.68rem;width:100%;box-sizing:border-box;resize:none"></textarea>
       <div class="sel-form-actions">
         <button type="submit" class="btn btn-primary btn-sm" style="font-size:0.6rem;padding:4px 10px">Post Comment</button>
-        <button type="button" class="btn btn-sm sel-cancel" style="font-size:0.6rem;padding:4px 10px">Cancel</button>
+        <button type="button" class="btn btn-sm sel-cancel" style="font-size:0.6rem;padding:4px 10px"><img src="Icons/icons8-cancel-24.png" width="12" style="vertical-align:middle;margin-right:4px">Cancel</button>
       </div>
     </form>`;
   const ta = pop.querySelector('textarea');
@@ -2405,7 +2517,7 @@ function cropModalHtml() {
       <div class="crop-panel">
         <div class="crop-panel-header">
           <span class="crop-title">Crop Character Image</span>
-          <span class="crop-hint">Drag to move &middot; handles to resize</span>
+          <span class="crop-hint">Drag image or box to position &middot; corners/edges resize &middot; 4:5 portrait &middot; scroll or pinch to zoom</span>
         </div>
         <div class="crop-stage" id="crop-stage">
           <img id="crop-img" alt="crop">
@@ -2414,6 +2526,11 @@ function cropModalHtml() {
             <span class="crop-handle ch-w"></span><span class="crop-handle ch-e"></span>
             <span class="crop-handle ch-sw"></span><span class="crop-handle ch-s"></span><span class="crop-handle ch-se"></span>
           </div>
+        </div>
+        <div class="crop-zoom-bar">
+          <button type="button" class="btn btn-sm crop-zoom-btn" id="crop-zoom-out" title="Zoom out">&minus;</button>
+          <span class="crop-zoom-val" id="crop-zoom-val">100%</span>
+          <button type="button" class="btn btn-sm crop-zoom-btn" id="crop-zoom-in" title="Zoom in">+</button>
         </div>
         <div class="crop-actions">
           <button type="button" class="btn btn-sm" id="crop-reset">Reset</button>
@@ -2424,7 +2541,9 @@ function cropModalHtml() {
     </div>`;
 }
 
-// Crop engine state
+// Crop engine state. RATIO = the final crop aspect (4:5 portrait), the same as
+// the character card display ratio so saved images fill their containers 1:1.
+const CROP_RATIO = 4 / 5;
 let cropCtx = null;
 
 function charCropOpen(file, onApply) {
@@ -2440,27 +2559,123 @@ function charCropOpen(file, onApply) {
   srcImg.onload = () => {
     cropCtx.ready = true;
     const sr = stage.getBoundingClientRect();
-    const scale = Math.min(sr.width / srcImg.naturalWidth, sr.height / srcImg.naturalHeight);
-    const dw = srcImg.naturalWidth * scale, dh = srcImg.naturalHeight * scale;
-    cropCtx.imgRect = { left: (sr.width - dw) / 2, top: (sr.height - dh) / 2, width: dw, height: dh, scale, nw: srcImg.naturalWidth, nh: srcImg.naturalHeight };
-    cropResetBox();
+    cropCtx.stageW = sr.width;
+    cropCtx.stageH = sr.height;
+    cropCtx.nw = srcImg.naturalWidth;
+    cropCtx.nh = srcImg.naturalHeight;
+    if (!cropCtx.nw || !cropCtx.nh) return cropClose(false);
+    cropCtx.fit = Math.min(sr.width / cropCtx.nw, sr.height / cropCtx.nh);
+    cropCtx.fill = Math.max(sr.width / cropCtx.nw, sr.height / cropCtx.nh);
+    cropCtx.minZoom = cropCtx.fill / cropCtx.fit; // always cover the stage, so a 4:5 box fits
+    cropZoomTo(cropCtx.minZoom, true);
+    cropReset();
   };
   disp.src = src;
   srcImg.src = src;
   modal.style.display = 'flex';
 }
 
-function cropResetBox() {
+// Move/scale the displayed image (zooming always stays anchored on the crop box center)
+function cropZoomTo(z, skipLabel) {
+  if (!cropCtx || !cropCtx.ready) return;
   const box = document.getElementById('crop-box');
-  if (!box || !cropCtx || !cropCtx.ready) return;
+  const stage = document.getElementById('crop-stage');
+  const ir = cropCtx.imgRect || { left: 0, top: 0, width: 0, height: 0 };
+  const bx = box ? box.offsetLeft + box.offsetWidth / 2 : stage.offsetWidth / 2;
+  const by = box ? box.offsetTop + box.offsetHeight / 2 : stage.offsetHeight / 2;
+  const fx = ir.width ? (bx - ir.left) / ir.width : 0.5;
+  const fy = ir.height ? (by - ir.top) / ir.height : 0.5;
+  const zc = Math.max(cropCtx.minZoom || 1, Math.min(8, z));
+  cropCtx.zoom = zc;
+  const w = cropCtx.nw * cropCtx.fit * zc;
+  const h = cropCtx.nh * cropCtx.fit * zc;
+  let left = bx - fx * w;
+  let top = by - fy * h;
+  const stageW = (stage && stage.offsetWidth) || w;
+  const stageH = (stage && stage.offsetHeight) || h;
+  if (w < stageW) left = (stageW - w) / 2;
+  if (h < stageH) top = (stageH - h) / 2;
+  cropCtx.imgRect = { left, top, width: w, height: h };
+  applyImageRect();
+  if (!skipLabel) updateZoomLabel();
+}
+
+function applyImageRect() {
+  const img = document.getElementById('crop-img');
+  if (!img || !cropCtx || !cropCtx.imgRect) return;
   const ir = cropCtx.imgRect;
-  let w = ir.width * 0.72;
-  let h = w * 1.25;
-  if (h > ir.height) { h = ir.height * 0.9; w = h / 1.25; }
-  const left = ir.left + (ir.width - w) / 2;
-  const top = ir.top + (ir.height - h) / 2;
-  box.style.left = left + 'px'; box.style.top = top + 'px';
-  box.style.width = w + 'px'; box.style.height = h + 'px';
+  img.style.left = ir.left + 'px';
+  img.style.top = ir.top + 'px';
+  img.style.width = ir.width + 'px';
+  img.style.height = ir.height + 'px';
+}
+
+function cropZoomBy(delta) {
+  if (!cropCtx || !cropCtx.ready) return;
+  cropZoomTo((cropCtx.zoom || cropCtx.minZoom || 1) + delta);
+}
+
+function updateZoomLabel() {
+  const el = document.getElementById('crop-zoom-val');
+  if (el && cropCtx) el.textContent = Math.round(((cropCtx.zoom || 1)) * 100) + '%';
+}
+
+function setBox(r) {
+  const box = document.getElementById('crop-box');
+  if (!box) return;
+  box.style.left = r.left + 'px';
+  box.style.top = r.top + 'px';
+  box.style.width = r.width + 'px';
+  box.style.height = r.height + 'px';
+}
+
+// Keep a crop rect fully inside the current image rect while preserving the ratio
+function clampBox(l, t, w, h) {
+  const ir = cropCtx && cropCtx.imgRect;
+  if (!ir) return { left: l, top: t, width: w, height: h };
+  const mn = Math.min(48, Math.min(ir.width, ir.height));
+  w = Math.max(mn, Math.min(w, ir.width));
+  h = w / CROP_RATIO;
+  if (h > ir.height) { h = ir.height; w = h * CROP_RATIO; }
+  if (w > ir.width) { w = ir.width; h = w / CROP_RATIO; }
+  if (h < mn) { h = mn; w = h * CROP_RATIO; }
+  if (w < mn) { w = mn; h = w / CROP_RATIO; }
+  l = Math.max(ir.left, Math.min(l, ir.left + ir.width - w));
+  t = Math.max(ir.top, Math.min(t, ir.top + ir.height - h));
+  return { left: l, top: t, width: w, height: h };
+}
+
+function cropReset() {
+  if (!cropCtx || !cropCtx.ready) return;
+  cropZoomTo(cropCtx.minZoom, true);
+  const ir = cropCtx.imgRect;
+  let w = Math.min(ir.width, ir.height * CROP_RATIO) * 0.8;
+  let h = w / CROP_RATIO;
+  if (h > ir.height) { h = ir.height; w = h * CROP_RATIO; }
+  const r = clampBox(ir.left + (ir.width - w) / 2, ir.top + (ir.height - h) / 2, w, h);
+  setBox(r);
+  updateZoomLabel();
+}
+
+// Ratio-locked resize: dragging a handle keeps the opposite corner/edge anchored
+// and forces width:height = 4:5.
+function resizeFromHandle(mode, o, px, py) {
+  const R = o.left + o.width, B = o.top + o.height;
+  const Cx = o.left + o.width / 2, Cy = o.top + o.height / 2;
+  const mn = 48;
+  let L, T, W, H;
+  switch (mode) {
+    case 'nw': W = Math.max(mn, R - px); H = W / CROP_RATIO; L = R - W; T = B - H; break;
+    case 'ne': W = Math.max(mn, px - o.left); H = W / CROP_RATIO; L = o.left; T = B - H; break;
+    case 'sw': W = Math.max(mn, R - px); H = W / CROP_RATIO; L = R - W; T = o.top; break;
+    case 'se': W = Math.max(mn, px - o.left); H = W / CROP_RATIO; L = o.left; T = o.top; break;
+    case 'n': H = Math.max(mn, B - py); W = H * CROP_RATIO; T = B - H; L = Cx - W / 2; break;
+    case 's': H = Math.max(mn, py - o.top); W = H * CROP_RATIO; T = o.top; L = Cx - W / 2; break;
+    case 'w': W = Math.max(mn, R - px); H = W / CROP_RATIO; L = R - W; T = Cy - H / 2; break;
+    case 'e': W = Math.max(mn, px - o.left); H = W / CROP_RATIO; L = o.left; T = Cy - H / 2; break;
+    default: return o;
+  }
+  return clampBox(L, T, W, H);
 }
 
 function cropClose(apply) {
@@ -2468,24 +2683,34 @@ function cropClose(apply) {
   cropCtx = null;
   const modal = document.getElementById('crop-modal');
   if (modal) modal.style.display = 'none';
-  if (!apply) return;
 }
 
 function charCropApply() {
   if (!cropCtx || !cropCtx.ready) return;
   const ir = cropCtx.imgRect;
+  const stage = document.getElementById('crop-stage');
   const box = document.getElementById('crop-box');
+  if (!ir || !stage || !box) return;
+  const sr = stage.getBoundingClientRect();
   const br = box.getBoundingClientRect();
-  const sx = Math.max(0, (br.left - ir.left) / ir.scale);
-  const sy = Math.max(0, (br.top - ir.top) / ir.scale);
-  const sw = Math.min(ir.nw - sx, br.width / ir.scale);
-  const sh = Math.min(ir.nh - sy, br.height / ir.scale);
+  const bLeft = br.left - sr.left, bTop = br.top - sr.top;
+  // Box -> natural image coordinates
+  const sx = Math.max(0, Math.min(ir.width ? (bLeft / ir.width) : 0, 1)) * cropCtx.nw;
+  const sy = Math.max(0, Math.min(ir.height ? (bTop / ir.height) : 0, 1)) * cropCtx.nh;
+  let sw = Math.min((br.width / ir.width) * cropCtx.nw, cropCtx.nw - sx);
+  let sh = Math.min((br.height / ir.height) * cropCtx.nh, cropCtx.nh - sy);
+  sw = Math.max(1, sw); sh = Math.max(1, sh);
+  // Output at exact 4:5 (snap the short side up so nothing is distorted or cut)
+  let oW = Math.round(sw), oH = Math.round(sh);
+  if (oW / oH < CROP_RATIO) oH = Math.round(oW / CROP_RATIO);
+  else oW = Math.round(oH * CROP_RATIO);
+  const maxDim = 1200;
+  if (Math.max(oW, oH) > maxDim) { const k = maxDim / Math.max(oW, oH); oW = Math.round(oW * k); oH = Math.round(oH * k); }
   const cv = document.createElement('canvas');
-  cv.width = Math.max(1, Math.round(sw));
-  cv.height = Math.max(1, Math.round(sh));
+  cv.width = Math.max(1, oW); cv.height = Math.max(1, oH);
   const ctx = cv.getContext('2d');
   ctx.drawImage(cropCtx.srcImg, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
-  const dataUrl = cv.toDataURL('image/jpeg', 0.9);
+  const dataUrl = cv.toDataURL('image/jpeg', 0.92);
   const onApply = cropCtx.onApply;
   cropClose(true);
   if (onApply) onApply(dataUrl);
@@ -2496,15 +2721,79 @@ function bindCharCropper() {
   if (!modal) return;
   const stage = document.getElementById('crop-stage');
   const box = document.getElementById('crop-box');
+
   document.getElementById('crop-overlay').addEventListener('click', () => cropClose(false));
   document.getElementById('crop-cancel').addEventListener('click', () => cropClose(false));
-  document.getElementById('crop-reset').addEventListener('click', cropResetBox);
+  document.getElementById('crop-reset').addEventListener('click', cropReset);
   document.getElementById('crop-apply').addEventListener('click', charCropApply);
+  const zi = document.getElementById('crop-zoom-in');
+  const zo = document.getElementById('crop-zoom-out');
+  if (zi) zi.addEventListener('click', () => cropZoomBy(0.25));
+  if (zo) zo.addEventListener('click', () => cropZoomBy(-0.25));
+
+  // Mouse-wheel zoom over the stage
+  stage.addEventListener('wheel', e => {
+    if (!cropCtx || !cropCtx.ready) return;
+    e.preventDefault();
+    cropZoomBy(e.deltaY < 0 ? 0.1 : -0.1);
+  }, { passive: false });
+
+  // Drag the IMAGE (empty stage area) to reposition it under the fixed box
+  let imgDrag = null;
+  stage.addEventListener('pointerdown', e => {
+    if (!cropCtx || !cropCtx.ready || (pinchActive)) return;
+    if (box && e.target && e.target.closest && e.target.closest('#crop-box')) return;
+    imgDrag = { id: e.pointerId, sx: e.clientX, sy: e.clientY, left: cropCtx.imgRect.left, top: cropCtx.imgRect.top };
+    stage.setPointerCapture(e.pointerId);
+  });
+  stage.addEventListener('pointermove', e => {
+    if (!cropCtx || !cropCtx.ready || !imgDrag || imgDrag.id !== e.pointerId) return;
+    const ir = cropCtx.imgRect;
+    const b = box;
+    // image may only move while keeping the box fully inside it
+    const minL = b.offsetLeft + b.offsetWidth - ir.width;
+    const maxL = b.offsetLeft;
+    const minT = b.offsetTop + b.offsetHeight - ir.height;
+    const maxT = b.offsetTop;
+    const nl = Math.max(minL, Math.min(maxL, imgDrag.left + (e.clientX - imgDrag.sx)));
+    const nt = Math.max(minT, Math.min(maxT, imgDrag.top + (e.clientY - imgDrag.sy)));
+    cropCtx.imgRect.left = nl;
+    cropCtx.imgRect.top = nt;
+    applyImageRect();
+  });
+  const endImgDrag = e => { if (imgDrag && imgDrag.id === e.pointerId) imgDrag = null; };
+  stage.addEventListener('pointerup', endImgDrag);
+  stage.addEventListener('pointercancel', endImgDrag);
+  let pinchActive = false;
+
+  // Pinch zoom (two fingers)
+  let pinch = null;
+  stage.addEventListener('touchstart', e => {
+    if (!cropCtx || !cropCtx.ready) return;
+    if (e.touches.length === 2) {
+      pinchActive = true;
+      imgDrag = null;
+      const a = e.touches[0], b = e.touches[1];
+      pinch = { d: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY), zoom: cropCtx.zoom || cropCtx.minZoom || 1 };
+    }
+  }, { passive: true });
+  stage.addEventListener('touchmove', e => {
+    if (!cropCtx || !cropCtx.ready) return;
+    if (pinch && e.touches.length === 2) {
+      e.preventDefault();
+      const a = e.touches[0], b = e.touches[1];
+      const d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      if (pinch.d > 0) cropZoomTo(pinch.zoom * (d / pinch.d));
+    }
+  }, { passive: false });
+  const endPinch = () => { pinch = null; pinchActive = false; };
+  stage.addEventListener('touchend', endPinch);
+  stage.addEventListener('touchcancel', endPinch);
 
   if (stage && box) {
     const drag = { mode: null };
     box.addEventListener('pointerdown', e => {
-      if (!cropCtx || !cropCtx.ready) return;
+      if (!cropCtx || !cropCtx.ready || pinchActive) return;
       e.preventDefault();
       const br = box.getBoundingClientRect();
       const mres = (e.target.className.match(/ch-(\w+)/) || [])[1];
@@ -2514,29 +2803,16 @@ function bindCharCropper() {
       box.setPointerCapture(e.pointerId);
     });
     box.addEventListener('pointermove', e => {
-      if (!cropCtx || !drag.mode) { drag.mode = null; return; }
+      if (!cropCtx || !drag.mode || pinchActive) { drag.mode = null; return; }
       if (!cropCtx.ready) return;
-      const ir = cropCtx.imgRect;
       const dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
-      let L = drag.ox, T = drag.oy, R = drag.ox + drag.ow, B = drag.oy + drag.oh;
-      const mn = 48;
+      let r;
       if (drag.mode === 'move') {
-        L += dx; T += dy;
-        R = L + drag.ow; B = T + drag.oh;
+        r = clampBox(drag.ox + dx, drag.oy + dy, drag.ow, drag.oh);
       } else {
-        if (drag.mode.indexOf('w') > -1) L += dx;
-        if (drag.mode.indexOf('e') > -1) R += dx;
-        if (drag.mode.indexOf('n') > -1) T += dy;
-        if (drag.mode.indexOf('s') > -1) B += dy;
+        r = resizeFromHandle(drag.mode, { left: drag.ox, top: drag.oy, width: drag.ow, height: drag.oh }, e.clientX, e.clientY);
       }
-      if (R - L < mn) { R = drag.mode.indexOf('e') > -1 ? L + mn : L; }
-      if (B - T < mn) { B = drag.mode.indexOf('s') > -1 ? T + mn : T; }
-      L = Math.max(ir.left, Math.min(L, ir.left + ir.width - mn));
-      T = Math.max(ir.top, Math.min(T, ir.top + ir.height - mn));
-      R = Math.max(L + mn, Math.min(R, ir.left + ir.width));
-      B = Math.max(T + mn, Math.min(B, ir.top + ir.height));
-      box.style.left = L + 'px'; box.style.top = T + 'px';
-      box.style.width = (R - L) + 'px'; box.style.height = (B - T) + 'px';
+      setBox(r);
     });
     const endDrag = () => { drag.mode = null; };
     box.addEventListener('pointerup', endDrag);
@@ -2614,7 +2890,7 @@ function renderEditor(bookId, chapterId) {
       <div class="ch-list-panel">
         <div class="ch-list-header" style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line2)">
           <span style="font-weight:600;font-size:0.85rem"><img src="Icons/books-stack-of-three.png" width="14" style="vertical-align:middle;margin-right:6px">Revision History</span>
-          <button class="btn btn-sm rd-rev-close" style="font-size:0.65rem">x</button>
+          <button class="btn btn-sm ic-x rd-rev-close" title="Close"><img src="Icons/icons8-cancel-24.png" alt="Close"></button>
         </div>
         <div class="ch-list-body" id="rev-list-body" style="overflow-y:auto;max-height:60vh">
           <p style="font-size:0.65rem;color:var(--text3);padding:16px;text-align:center">Loading...</p>
@@ -3752,21 +4028,20 @@ function renderChapterReader(bookId, chapterId) {
     state._readerFor = chapterId;
   }
   let contentHtml;
-  let pageNavHtml = '';
   if (!paged) {
     contentHtml = blocks.map((b, i) => paragraphHtml(bookId, chapterId, b, i)).join('');
   } else {
-    const pages = paginateBlocks(blocks, 1600);
+    const pages = paginateBlocks(blocks, READER_PAGE_CHARS);
     const pi = Math.min(state.readerPageIndex || 0, pages.length - 1);
     state.readerPageIndex = pi;
-    pageNavHtml = `<div class="reader-page-nav">
-      <button class="btn btn-sm rd-page-prev" ${pi <= 0 ? 'disabled' : ''} style="font-size:0.6rem">&#8249; Prev</button>
-      <span class="reader-page-count">Page ${pi + 1} / ${pages.length}</span>
-      <button class="btn btn-sm rd-page-next" ${pi >= pages.length - 1 ? 'disabled' : ''} style="font-size:0.6rem">Next &#8250;</button>
-    </div>`;
     let acc = 0;
     pages.slice(0, pi).forEach(p => { acc += p.length; });
-    contentHtml = pageNavHtml + pages[pi].map((b, k) => paragraphHtml(bookId, chapterId, b, acc + k)).join('');
+    const body = pages[pi].map((b, k) => paragraphHtml(bookId, chapterId, b, acc + k)).join('');
+    contentHtml = `<div class="reader-pages" id="reader-pages" data-total="${pages.length}" data-book="${bookId}" data-chapter="${chapterId}">
+      <div class="rp-track" id="rp-track">
+        <div class="rp-page">${readerPageNavHtml(pi, pages.length)}${body}</div>
+      </div>
+    </div>`;
   }
   const readerFont = Math.max(0.8, Math.min(1.6, +(state.readerFontSize || 1)));
 
@@ -3776,7 +4051,7 @@ function renderChapterReader(bookId, chapterId) {
         <a class="back-link" href="#/book/${bookId}" style="padding:0"><img src="Icons/open-book.png" width="14" style="vertical-align:middle;margin-right:4px">Back to Book</a>
         <span class="reader-chapter-info">Ch. ${ch.chapterNumber} &middot; ${ch.title}</span>
         <span class="reader-header-actions">
-          <a class="btn btn-sm rd-comments-link" href="#/book/${bookId}/comments/${chapterId}" style="font-size:0.6rem;padding:3px 8px"><img src="Icons/inbox.png" width="12" style="vertical-align:middle;margin-right:4px">Comments</a>
+          <a class="btn btn-sm rd-comments-link" href="#/book/${bookId}/comments/${chapterId}" style="font-size:0.6rem;padding:3px 8px"><img src="Icons/icons8-comments-50.png" width="13" style="vertical-align:middle;margin-right:4px">Comments</a>
           <button class="btn btn-sm rd-menu-toggle" style="font-size:0.6rem;padding:3px 8px"><img src="Icons/settings.png" width="12" style="vertical-align:middle;margin-right:4px">Menu</button>
         </span>
       </div>
@@ -3788,8 +4063,8 @@ function renderChapterReader(bookId, chapterId) {
         <div class="para-overlay"></div>
         <div class="para-panel">
           <div class="para-header">
-            <span style="font-weight:600;font-size:0.85rem">Paragraph Comments</span>
-            <button class="btn btn-sm para-close" style="font-size:0.65rem">x</button>
+            <span style="font-weight:600;font-size:0.85rem"><img src="Icons/icons8-comments-50.png" width="15" style="vertical-align:middle;margin-right:6px">Paragraph Comments</span>
+            <button class="btn btn-sm ic-x para-close" title="Close"><img src="Icons/icons8-cancel-24.png" alt="Close"></button>
           </div>
           ${state.loggedIn ? `
           <form class="para-form" style="display:flex;gap:6px;padding:10px 14px;border-bottom:1px solid var(--line2)">
@@ -3805,8 +4080,8 @@ function renderChapterReader(bookId, chapterId) {
         <div class="hl-overlay"></div>
         <div class="hl-panel">
           <div class="hl-header">
-            <span style="font-weight:600;font-size:0.85rem">Highlighted Passage</span>
-            <button class="btn btn-sm hl-close" style="font-size:0.65rem">x</button>
+            <span style="font-weight:600;font-size:0.85rem"><img src="Icons/icons8-comments-50.png" width="15" style="vertical-align:middle;margin-right:6px">Highlighted Passage</span>
+            <button class="btn btn-sm ic-x hl-close" title="Close"><img src="Icons/icons8-cancel-24.png" alt="Close"></button>
           </div>
           <div class="hl-quote" id="hl-quote"></div>
           ${state.loggedIn ? `
@@ -3866,7 +4141,7 @@ function renderChapterReader(bookId, chapterId) {
 
         <!-- Comments Section -->
         <div class="end-card">
-          <div class="end-card-label"><img src="Icons/inbox.png" width="14" style="vertical-align:middle;margin-right:6px">Chapter Discussion</div>
+          <div class="end-card-label"><img src="Icons/icons8-comments-50.png" width="15" style="vertical-align:middle;margin-right:6px">Chapter Discussion</div>
           ${state.loggedIn ? `
           <form class="ch-comment-form" data-book="${bookId}" data-chapter="${chapterId}" style="margin-bottom:10px">
             <textarea class="input-field" name="content" placeholder="Comment on this chapter..." rows="2" style="margin-bottom:6px"></textarea>
@@ -3891,7 +4166,7 @@ function renderChapterReader(bookId, chapterId) {
     <div class="reader-sheet" id="reader-sheet">
       <div class="reader-sheet-overlay"></div>
       <div class="reader-sheet-panel">
-        <div class="reader-sheet-title">Reader Settings <button class="btn btn-sm rd-sheet-close" style="font-size:0.65rem">x</button></div>
+        <div class="reader-sheet-title"><span><img src="Icons/settings.png" width="15" style="vertical-align:middle;margin-right:6px">Reader Settings</span> <button class="btn btn-sm ic-x rd-sheet-close" title="Close"><img src="Icons/icons8-cancel-24.png" alt="Close"></button></div>
         <div class="reader-sheet-row">
           <span class="reader-sheet-label">Font Size</span>
           <span class="reader-sheet-btns">
@@ -3905,9 +4180,9 @@ function renderChapterReader(bookId, chapterId) {
           <button class="btn btn-sm rd-scroll-toggle" style="font-size:0.65rem;padding:4px 10px;background:var(--bg-hover);color:var(--accent)">${paged ? 'Page by Page' : 'Continuous'}</button>
         </div>
         <div class="reader-sheet-actions">
-          <button class="btn btn-sm rd-chapter-list" data-book="${bookId}" style="font-size:0.62rem;padding:4px 10px">Chapters</button>
-          <a class="btn btn-sm" href="#/book/${bookId}/comments/${chapterId}" style="font-size:0.62rem;padding:4px 10px">Comments</a>
-          <a class="btn btn-sm" href="#/book/${bookId}" style="font-size:0.62rem;padding:4px 10px">Book Page</a>
+          <button class="btn btn-sm rd-chapter-list" data-book="${bookId}" style="font-size:0.62rem;padding:4px 10px"><img src="Icons/books-stack-of-three.png" width="13" style="vertical-align:middle;margin-right:4px">Chapters</button>
+          <a class="btn btn-sm" href="#/book/${bookId}/comments/${chapterId}" style="font-size:0.62rem;padding:4px 10px"><img src="Icons/icons8-comments-50.png" width="13" style="vertical-align:middle;margin-right:4px">Comments</a>
+          <a class="btn btn-sm" href="#/book/${bookId}" style="font-size:0.62rem;padding:4px 10px"><img src="Icons/open-book.png" width="13" style="vertical-align:middle;margin-right:4px">Book Page</a>
         </div>
       </div>
     </div>
@@ -3917,8 +4192,8 @@ function renderChapterReader(bookId, chapterId) {
       <div class="ch-list-overlay"></div>
       <div class="ch-list-panel">
         <div class="ch-list-header" style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line2)">
-          <span style="font-weight:600;font-size:0.85rem">Chapters</span>
-          <button class="btn btn-sm rd-ch-list-close" style="font-size:0.65rem">x</button>
+          <span style="font-weight:600;font-size:0.85rem"><img src="Icons/books-stack-of-three.png" width="15" style="vertical-align:middle;margin-right:6px">Chapters</span>
+          <button class="btn btn-sm ic-x rd-ch-list-close" title="Close"><img src="Icons/icons8-cancel-24.png" alt="Close"></button>
         </div>
         <div class="ch-list-body" style="overflow-y:auto;max-height:60vh">
           ${publishedChs.map(ch => `
@@ -3953,7 +4228,7 @@ function renderChapterComments(bookId, chapterId) {
       </div>
       <h1 class="reader-title">Chapter Discussion</h1>
       <div class="end-card" style="text-align:left">
-        <div class="end-card-label"><img src="Icons/inbox.png" width="14" style="vertical-align:middle;margin-right:6px">Comments on this chapter</div>
+        <div class="end-card-label"><img src="Icons/icons8-comments-50.png" width="15" style="vertical-align:middle;margin-right:6px">Comments on this chapter</div>
         ${state.loggedIn ? `
         <form class="ch-comment-form" data-book="${bookId}" data-chapter="${chapterId}" style="margin-bottom:10px">
           <textarea class="input-field" name="content" placeholder="Comment on this chapter..." rows="2" style="margin-bottom:6px"></textarea>
@@ -4023,6 +4298,8 @@ function renderHighlightsPage(bookId) {
 // EVENT BINDING
 // ============================================================
 function bindPageEvents(route) {
+  bindReaderSwipe();
+
   // ---- Create Book form ----
   const createForm = document.getElementById('create-book-form');
   if (createForm) {
