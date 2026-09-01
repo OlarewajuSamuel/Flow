@@ -29,18 +29,31 @@ function getState() {
     characters: {},
     favorites: [],
     flames: {},
+    following: [],
     wallPosts: [],
     profileComments: [],
     supporterHistory: [],
     notifications: [],
+    messages: [],
     flameDate: '',
     flamesGiven: 0,
     flameAllowance: 2,
     flamesRemaining: 2,
     reviews: {},
     chapterComments: {},
+    chapterHighlights: {},
     chapterReactions: {},
     readingProgress: [],
+    achievements: {},
+    readerFontSize: 1,
+    readerScrollMode: 'continuous',
+    readerPageIndex: 0,
+    readsTotal: 0,
+    writeStreak: 0,
+    lastWriteDate: '',
+    writeDates: [],
+    dayWords: {},
+    achFlags: {},
   };
   try {
     const saved = localStorage.getItem('novelState');
@@ -104,6 +117,29 @@ async function initAuth() {
   }
 }
 
+// Merge per-day view maps (date -> count), keeping the higher count per day so
+// local (offline) traffic never regresses when server stats are loaded.
+function mergeDailyViews(a, b) {
+  const aD = a || {}, bD = b || {};
+  const days = new Set([...Object.keys(aD), ...Object.keys(bD)]);
+  const out = {};
+  days.forEach(k => { out[k] = Math.max(aD[k] || 0, bD[k] || 0); });
+  return out;
+}
+
+// Merge server book stats into the existing local book so running counters
+// (views, dailyViews) keep increasing instead of being reset by a sync.
+function mergeServerBook(book) {
+  const nb = normalizeServerBook(book);
+  const existing = state.books.find(b => b.id === book.id);
+  if (!existing) { if (!nb.dailyViews) nb.dailyViews = {}; return nb; }
+  nb.views = Math.max(existing.views || 0, nb.views || 0);
+  nb.dailyViews = mergeDailyViews(existing.dailyViews, book.dailyViews);
+  nb.favorites = existing.favorites || nb.favorites || 0;
+  nb.flames = Math.max(existing.flames || 0, nb.flames ?? existing.flames ?? 0);
+  return nb;
+}
+
 // ── Server data sync ────────────────────────────
 async function loadServerData() {
   if (!serverOnline) return;
@@ -111,7 +147,7 @@ async function loadServerData() {
   const publicBooks = await apiFetch('/api/books');
   const ownBooks = state.user.id ? await apiFetch(`/api/books?author_id=${state.user.id}`) : [];
   const mergedBooks = [...(publicBooks || []), ...(ownBooks || [])].reduce((map, book) => {
-    map.set(book.id, normalizeServerBook(book));
+    map.set(book.id, mergeServerBook(book));
     return map;
   }, new Map());
   const books = [...mergedBooks.values()];
@@ -125,7 +161,7 @@ async function loadServerData() {
       if (chars && Array.isArray(chars)) state.characters[book.id] = chars.map(c => ({ ...c, image: c.image || c.portrait || '', description: c.description || c.biography || '' }));
       // Load reviews
       const reviews = await apiFetch(`/api/books/${book.id}/reviews`);
-      if (reviews && Array.isArray(reviews)) state.reviews[book.id] = reviews;
+      if (reviews && Array.isArray(reviews)) state.reviews[book.id] = reviews.map(rv => ({ ...rv, ratings: parseRatings(rv.ratings) }));
       // Load flames
       const f = await apiFetch(`/api/books/${book.id}/flames`);
       if (f) {
@@ -175,9 +211,15 @@ async function apiSync(method, path, body) {
   if (!serverOnline) return null;
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
-  const res = await apiFetch(path, opts);
-  if (!res) { serverOnline = false; }
-  return res;
+  try {
+    const res = await fetch(`${API_BASE}${path}`, { credentials: 'include', ...opts });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    // Only a real network failure means the server is offline; HTTP errors (4xx/5xx) don't.
+    serverOnline = false;
+    return null;
+  }
 }
 
 async function syncCreateBook(book) {
@@ -248,10 +290,22 @@ async function syncDeleteChapter(chapterId) {
 
 async function syncCreateCharacter(bookId, char) {
   const res = await apiSync('POST', `/api/books/${bookId}/characters`, {
-    name: char.name, biography: char.description, portrait: char.image
+    name: char.name, nickname: char.nickname, age: char.age, height: char.height, weight: char.weight,
+    biography: char.description, portrait: char.image
   });
   if (res) {
-    Object.assign(char, { ...res, image: res.portrait || char.image, description: res.biography || char.description });
+    Object.assign(char, { ...res, serverId: res.id, image: res.portrait || char.image, description: res.biography || char.description });
+    saveState();
+  }
+}
+
+async function syncUpdateCharacter(charId, char) {
+  const res = await apiSync('PUT', `/api/characters/${charId}`, {
+    name: char.name, nickname: char.nickname, age: char.age, height: char.height, weight: char.weight,
+    biography: char.description, portrait: char.image
+  });
+  if (res) {
+    Object.assign(char, { ...res, serverId: res.id, image: res.portrait || char.image, description: res.biography || char.description });
     saveState();
   }
 }
@@ -261,7 +315,7 @@ async function syncDeleteCharacter(charId) {
 }
 
 async function syncRecordView(bookId) {
-  await apiSync('POST', `/api/books/${bookId}/view`);
+  await apiSync('POST', `/api/books/${bookId}/view`, { amount: 10 });
 }
 
 async function syncGetFlamesRemaining() {
@@ -269,8 +323,8 @@ async function syncGetFlamesRemaining() {
   return res;
 }
 
-async function syncGiveFlame(bookId) {
-  const res = await apiSync('POST', `/api/books/${bookId}/flame`);
+async function syncGiveFlame(bookId, amount) {
+  const res = await apiSync('POST', `/api/books/${bookId}/flame`, amount ? { amount } : undefined);
   return res;
 }
 
@@ -429,6 +483,336 @@ function showToast(msg, duration) {
 // ============================================================
 function genId() { return 'b' + Date.now() + Math.random().toString(36).slice(2,5); }
 function today() { return new Date().toISOString().split('T')[0]; }
+
+// Midnight reset countdown for daily flames
+function midnightCountdown() {
+  const now = new Date();
+  const mid = new Date(now); 
+  mid.setHours(24, 0, 0, 0);
+  const diff = Math.max(0, mid - now);
+  const h = Math.floor(diff / 3600000);
+  const m = Math.floor((diff % 3600000) / 60000);
+  return `resets at 00:00 (${h}h ${m}m)`;
+}
+
+// Daily flame status line (live remaining + reset)
+function flameStatusLine() {
+  if (!state.loggedIn) return 'sign in to send flames';
+  const td = new Date().toDateString();
+  const lv = state.user.level || 1;
+  const maxF = dailyFlameAllowance(lv);
+  const rem = serverOnline ? (state.flamesRemaining ?? maxF) : (state.flameDate === td ? Math.max(0, maxF - (state.flamesGiven || 0)) : maxF);
+  return `${rem} / ${maxF} today \u00b7 ${midnightCountdown()}`;
+}
+
+// Add a local notification (also mirrors to server when available)
+function addNotification(type, message) {
+  if (!state.notifications) state.notifications = [];
+  const n = { id: 'n' + Date.now() + Math.floor(Math.random()*999), type, message, read: 0, created_at: new Date().toISOString(), local: true };
+  state.notifications.unshift(n);
+  saveState();
+  return n;
+}
+
+// Total unread badge count (server notifications + reply messages)
+function unreadTotal() {
+  const notif = (state.notifications || []).filter(n => !n.read).length;
+  const msgs = (state.messages || []).filter(m => !m.read && m.to === state.user.username).length;
+  return notif + msgs;
+}
+
+// ---- Achievement system ----
+function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+
+function countWords(s) {
+  const t = String(s || '').trim();
+  return t ? t.split(/\s+/).length : 0;
+}
+
+function unlockAchievement(key) {
+  if (!state.achievements) state.achievements = {};
+  if (!state.achievements[key]) {
+    state.achievements[key] = new Date().toISOString();
+    saveState();
+  }
+}
+
+// Track writing activity for streaks / daily word challenges / time-based milestones
+function trackWrite(wordsAdded) {
+  if (!wordsAdded || wordsAdded <= 0) return;
+  const now = new Date();
+  const key = now.getFullYear() + '-' + pad2(now.getMonth() + 1) + '-' + pad2(now.getDate());
+  if (!state.dayWords) state.dayWords = {};
+  state.dayWords[key] = (state.dayWords[key] || 0) + wordsAdded;
+  if (!state.writeDates) state.writeDates = [];
+  if (state.writeDates.indexOf(key) === -1) state.writeDates.push(key);
+  const y = new Date(now.getTime() - 86400000);
+  const yKey = y.getFullYear() + '-' + pad2(y.getMonth() + 1) + '-' + pad2(y.getDate());
+  if (state.lastWriteDate === yKey) {
+    state.writeStreak = (state.writeStreak || 0) + 1;
+  } else if (state.lastWriteDate !== key) {
+    state.writeStreak = 1;
+  }
+  state.lastWriteDate = key;
+  if (!state.achFlags) state.achFlags = {};
+  const h = now.getHours(), day = now.getDay();
+  if (day === 1) state.achFlags.monday = true;
+  if (day === 0 || day === 6) state.achFlags.weekend = true;
+  if (h === 0) state.achFlags.midnight = true;
+  if (h < 7) state.achFlags.earlybird = true;
+  if (h >= 22) state.achFlags.nightowl = true;
+  saveState();
+}
+
+function achievementMetrics() {
+  const myBooks = getBooksByAuthor();
+  const myBookIds = myBooks.map(b => b.id);
+  const totalViews = myBooks.reduce((s, b) => s + (b.views || 0), 0);
+  const totalFlames = myBooks.reduce((s, b) => s + (b.flames || 0), 0);
+  const totalLikes = myBooks.reduce((s, b) => s + (b.favorites || 0), 0);
+  const pubBooks = myBooks.filter(b => b.status !== 'Draft').length;
+  const compBooks = myBooks.filter(b => b.status === 'Completed').length;
+  const um = state.user.username;
+  let wordsTotal = 0, chaptersTotal = 0, pubChapters = 0;
+  const bookWords = {};
+  myBooks.forEach(b => {
+    const chs = state.chapters[b.id] || [];
+    let w = 0;
+    chs.forEach(c => {
+      w += countWords(c.content);
+      if (c.published) pubChapters++;
+    });
+    chaptersTotal += chs.length;
+    wordsTotal += w;
+    bookWords[b.id] = w;
+  });
+  let commentsReceived = 0, commentsMade = 0, likesOnComments = 0;
+  Object.keys(state.chapterComments || {}).forEach(k => {
+    const arr = state.chapterComments[k];
+    const bookId = String(k).split('_')[0];
+    arr.forEach(c => {
+      if (c.username === um) commentsMade++;
+      else if (myBookIds.indexOf(bookId) > -1) commentsReceived++;
+      if (c.username === um) likesOnComments += (c.likes || []).length;
+    });
+  });
+  Object.keys(state.reviews || {}).forEach(bookId => {
+    (state.reviews[bookId] || []).forEach(r => {
+      if (r.username === um) commentsMade++;
+      else if (myBookIds.indexOf(bookId) > -1) commentsReceived++;
+      if (r.username === um) likesOnComments += (r.likes || []).length;
+    });
+  });
+  commentsMade += (state.wallPosts || []).filter(p => p.user === um).length;
+  const reads = state.readsTotal || 0;
+  const prog = state.readingProgress || [];
+  const booksRead = prog.length;
+  const booksCompleted = prog.filter(p => (p.completion_pct || 0) >= 100).length;
+  const genresRead = new Set(prog.map(p => { const b = getBook(p.book_id); return b ? (b.genre || '') : ''; }).filter(Boolean)).size;
+  const genresWritten = new Set(myBooks.map(b => (b.genre || '')).filter(Boolean)).size;
+  const dayWords = state.dayWords || {};
+  const now = new Date();
+  const mKey = now.getFullYear() + '-' + pad2(now.getMonth() + 1);
+  let topDay = 0, weekWords = 0, monthWords = 0;
+  Object.keys(dayWords).forEach(k => {
+    const v = dayWords[k];
+    if (v > topDay) topDay = v;
+    const kd = new Date(k + 'T12:00:00');
+    if (!isNaN(kd.getTime()) && kd <= now && (now - kd) < 7 * 86400000) weekWords += v;
+    if (k.indexOf(mKey) === 0) monthWords += v;
+  });
+  const jd = state.user.joinDate ? new Date(state.user.joinDate) : null;
+  const joinAgeYears = (jd && !isNaN(jd.getTime())) ? (Date.now() - jd.getTime()) / (365.25 * 86400000) : 0;
+  return {
+    myBooks, myBookIds, bookWords, wordsTotal, chaptersTotal, pubChapters, totalViews,
+    totalFlames, totalLikes, pubBooks, compBooks, commentsReceived, commentsMade, likesOnComments,
+    reads, booksRead, booksCompleted, genresRead, genresWritten, topDay, weekWords, monthWords,
+    followers: state.user.followers || 0, following: (state.following || []).length,
+    likesGiven: state.favorites.length, exp: state.user.exp || 0,
+    joinAgeYears, streak: state.writeStreak || 0, writeDays: (state.writeDates || []).length,
+    flags: state.achFlags || {},
+  };
+}
+
+const ACHIEVEMENT_GROUPS = ['Writing', 'Chapters', 'Views', 'Engagement', 'Flames', 'Community', 'Consistency', 'Reading', 'Publishing', 'Challenge', 'Secret'];
+
+const ACHIEVEMENT_DEFS = [
+  // ---- Writing (total words) ----
+  { key: 'first_words', group: 'Writing', icon: 'Icons/editpen.png', label: 'First Words', desc: 'Write 100 total words', hit: m => m.wordsTotal >= 100 },
+  { key: 'getting_started', group: 'Writing', icon: 'Icons/agenda.png', label: 'Getting Started', desc: 'Write 500 total words', hit: m => m.wordsTotal >= 500 },
+  { key: 'warm_up', group: 'Writing', icon: 'Icons/agenda1.png', label: 'Warm Up', desc: 'Write 1,000 total words', hit: m => m.wordsTotal >= 1000 },
+  { key: 'novice_writer', group: 'Writing', icon: 'Icons/app.png', label: 'Novice Writer', desc: 'Write 2,000 total words', hit: m => m.wordsTotal >= 2000 },
+  { key: 'page_turner', group: 'Writing', icon: 'Icons/editpen.png', label: 'Page Turner', desc: 'Write 5,000 total words', hit: m => m.wordsTotal >= 5000 },
+  { key: 'storyteller', group: 'Writing', icon: 'Icons/book.png', label: 'Storyteller', desc: 'Write 10,000 total words', hit: m => m.wordsTotal >= 10000 },
+  { key: 'wordsmith', group: 'Writing', icon: 'Icons/bookmark.png', label: 'Wordsmith', desc: 'Write 25,000 total words', hit: m => m.wordsTotal >= 25000 },
+  { key: 'author_in_training', group: 'Writing', icon: 'Icons/graph.png', label: 'Author in Training', desc: 'Write 50,000 total words', hit: m => m.wordsTotal >= 50000 },
+  { key: 'published_author', group: 'Writing', icon: 'Icons/premium.png', label: 'Published Author', desc: 'Write 100,000 total words', hit: m => m.wordsTotal >= 100000 },
+  { key: 'prolific_writer', group: 'Writing', icon: 'Icons/vip-card.png', label: 'Prolific Writer', desc: 'Write 250,000 total words', hit: m => m.wordsTotal >= 250000 },
+  { key: 'master_storyteller', group: 'Writing', icon: 'Icons/diamond.png', label: 'Master Storyteller', desc: 'Write 500,000 total words', hit: m => m.wordsTotal >= 500000 },
+  { key: 'legendary_author', group: 'Writing', icon: 'Icons/star.png', label: 'Legendary Author', desc: 'Write 1,000,000 total words', hit: m => m.wordsTotal >= 1000000 },
+  { key: 'beyond_words', group: 'Writing', icon: 'Icons/planet.png', label: 'Beyond Words', desc: 'Write 5,000,000 total words', hit: m => m.wordsTotal >= 5000000 },
+
+  // ---- Chapters (published) ----
+  { key: 'first_chapter', group: 'Chapters', icon: 'Icons/books-stack-of-three.png', label: 'First Chapter', desc: 'Publish your first chapter', hit: m => m.pubChapters >= 1 },
+  { key: 'getting_somewhere', group: 'Chapters', icon: 'Icons/books-stack-of-three.png', label: 'Getting Somewhere', desc: 'Publish 5 chapters', hit: m => m.pubChapters >= 5 },
+  { key: 'story_begins', group: 'Chapters', icon: 'Icons/books-stack-of-three.png', label: 'Story Begins', desc: 'Publish 10 chapters', hit: m => m.pubChapters >= 10 },
+  { key: 'dedicated_writer', group: 'Chapters', icon: 'Icons/book.png', label: 'Dedicated Writer', desc: 'Publish 25 chapters', hit: m => m.pubChapters >= 25 },
+  { key: 'serial_writer', group: 'Chapters', icon: 'Icons/book.png', label: 'Serial Writer', desc: 'Publish 50 chapters', hit: m => m.pubChapters >= 50 },
+  { key: 'veteran_author', group: 'Chapters', icon: 'Icons/agenda.png', label: 'Veteran Author', desc: 'Publish 100 chapters', hit: m => m.pubChapters >= 100 },
+  { key: 'chapter_machine', group: 'Chapters', icon: 'Icons/agenda1.png', label: 'Chapter Machine', desc: 'Publish 250 chapters', hit: m => m.pubChapters >= 250 },
+  { key: 'endless_story', group: 'Chapters', icon: 'Icons/agenda.png', label: 'Endless Story', desc: 'Publish 500 chapters', hit: m => m.pubChapters >= 500 },
+  { key: 'library_builder', group: 'Chapters', icon: 'Icons/books-stack-of-three.png', label: 'Library Builder', desc: 'Publish 1,000 chapters', hit: m => m.pubChapters >= 1000 },
+
+  // ---- Views ----
+  { key: 'first_look', group: 'Views', icon: 'Icons/view.png', label: 'First Look', desc: 'Get 10 total views', hit: m => m.totalViews >= 10 },
+  { key: 'someone_read_it', group: 'Views', icon: 'Icons/view.png', label: 'Someone Read It', desc: 'Get 50 total views', hit: m => m.totalViews >= 50 },
+  { key: 'views_100', group: 'Views', icon: 'Icons/view.png', label: 'First Audience', desc: 'Get 100 total views', hit: m => m.totalViews >= 100 },
+  { key: 'rising_story', group: 'Views', icon: 'Icons/eye.png', label: 'Rising Story', desc: 'Get 500 total views', hit: m => m.totalViews >= 500 },
+  { key: 'views_1k', group: 'Views', icon: 'Icons/view.png', label: 'Getting Noticed', desc: 'Get 1,000 total views', hit: m => m.totalViews >= 1000 },
+  { key: 'popular', group: 'Views', icon: 'Icons/view.png', label: 'Popular', desc: 'Get 5,000 total views', hit: m => m.totalViews >= 5000 },
+  { key: 'views_100k', group: 'Views', icon: 'Icons/view.png', label: 'Trending', desc: 'Get 10,000 total views', hit: m => m.totalViews >= 10000 },
+  { key: 'breakout', group: 'Views', icon: 'Icons/eye.png', label: 'Breakout Story', desc: 'Get 25,000 total views', hit: m => m.totalViews >= 25000 },
+  { key: 'fan_favorite_v', group: 'Views', icon: 'Icons/eye.png', label: 'Fan Favorite', desc: 'Get 50,000 total views', hit: m => m.totalViews >= 50000 },
+  { key: 'hit_story', group: 'Views', icon: 'Icons/view.png', label: 'Hit Story', desc: 'Get 100,000 total views', hit: m => m.totalViews >= 100000 },
+  { key: 'bestseller', group: 'Views', icon: 'Icons/view.png', label: 'Bestseller', desc: 'Get 500,000 total views', hit: m => m.totalViews >= 500000 },
+  { key: 'phenomenon', group: 'Views', icon: 'Icons/eye.png', label: 'Phenomenon', desc: 'Get 1,000,000 total views', hit: m => m.totalViews >= 1000000 },
+  { key: 'legendary_reach', group: 'Views', icon: 'Icons/view.png', label: 'Legendary Reach', desc: 'Get 10,000,000 total views', hit: m => m.totalViews >= 10000000 },
+
+  // ---- Engagement (favorites + comments received) ----
+  { key: 'first_like', group: 'Engagement', icon: 'Icons/icons8-thumbs-up-24.png', label: 'First Like', desc: 'Receive your first favorite', hit: m => m.totalLikes >= 1 },
+  { key: 'appreciated', group: 'Engagement', icon: 'Icons/icons8-thumbs-up-24.png', label: 'Appreciated', desc: 'Receive 10 favorites', hit: m => m.totalLikes >= 10 },
+  { key: 'loved', group: 'Engagement', icon: 'Icons/like.png', label: 'Loved', desc: 'Receive 100 favorites', hit: m => m.totalLikes >= 100 },
+  { key: 'crowd_favorite', group: 'Engagement', icon: 'Icons/icons8-thumbs-up-24.png', label: 'Crowd Favorite', desc: 'Receive 500 favorites', hit: m => m.totalLikes >= 500 },
+  { key: 'beloved', group: 'Engagement', icon: 'Icons/like.png', label: 'Beloved', desc: 'Receive 1,000 favorites', hit: m => m.totalLikes >= 1000 },
+  { key: 'iconic', group: 'Engagement', icon: 'Icons/like.png', label: 'Iconic', desc: 'Receive 10,000 favorites', hit: m => m.totalLikes >= 10000 },
+  { key: 'first_reaction', group: 'Engagement', icon: 'Icons/icons8-comments-50.png', label: 'First Reaction', desc: 'Receive your first comment', hit: m => m.commentsReceived >= 1 },
+  { key: 'conversation_starter', group: 'Engagement', icon: 'Icons/icons8-comments-50.png', label: 'Conversation Starter', desc: 'Receive 10 comments', hit: m => m.commentsReceived >= 10 },
+  { key: 'discussion', group: 'Engagement', icon: 'Icons/icons8-comments-50.png', label: 'Discussion', desc: 'Receive 50 comments', hit: m => m.commentsReceived >= 50 },
+  { key: 'community_favorite', group: 'Engagement', icon: 'Icons/icons8-comments-50.png', label: 'Community Favorite', desc: 'Receive 100 comments', hit: m => m.commentsReceived >= 100 },
+  { key: 'talk_of_the_town', group: 'Engagement', icon: 'Icons/icons8-comments-50.png', label: 'Talk of the Town', desc: 'Receive 500 comments', hit: m => m.commentsReceived >= 500 },
+  { key: 'discussion_legend', group: 'Engagement', icon: 'Icons/icons8-comments-50.png', label: 'Discussion Legend', desc: 'Receive 1,000 comments', hit: m => m.commentsReceived >= 1000 },
+
+  // ---- Flames ----
+  { key: 'first_flame', group: 'Flames', icon: 'Icons/fire.png', label: 'First Flame', desc: 'Receive your first flame', hit: m => m.totalFlames >= 1 },
+  { key: 'flames_100', group: 'Flames', icon: 'Icons/fire-flame.png', label: '100 Flames', desc: 'Receive 100 flames', hit: m => m.totalFlames >= 100 },
+  { key: 'flames_500', group: 'Flames', icon: 'Icons/fire-flame.png', label: '500 Flames', desc: 'Receive 500 flames', hit: m => m.totalFlames >= 500 },
+  { key: 'flames_1k', group: 'Flames', icon: 'Icons/flames.png', label: '1,000 Flames', desc: 'Receive 1,000 flames', hit: m => m.totalFlames >= 1000 },
+  { key: 'flames_10k', group: 'Flames', icon: 'Icons/flames.png', label: '10,000 Flames', desc: 'Receive 10,000 flames', hit: m => m.totalFlames >= 10000 },
+
+  // ---- Community ----
+  { key: 'first_follower', group: 'Community', icon: 'Icons/user1.png', label: 'First Follower', desc: 'Gain your first follower', hit: m => m.followers >= 1 },
+  { key: 'small_following', group: 'Community', icon: 'Icons/user1.png', label: 'Small Following', desc: 'Gain 10 followers', hit: m => m.followers >= 10 },
+  { key: 'growing_audience', group: 'Community', icon: 'Icons/icons8-users-50.png', label: 'Growing Audience', desc: 'Gain 50 followers', hit: m => m.followers >= 50 },
+  { key: 'recognized', group: 'Community', icon: 'Icons/icons8-users-50.png', label: 'Recognized', desc: 'Gain 100 followers', hit: m => m.followers >= 100 },
+  { key: 'established', group: 'Community', icon: 'Icons/user1.png', label: 'Established', desc: 'Gain 500 followers', hit: m => m.followers >= 500 },
+  { key: 'influencer', group: 'Community', icon: 'Icons/icons8-users-50.png', label: 'Influencer', desc: 'Gain 1,000 followers', hit: m => m.followers >= 1000 },
+  { key: 'star_author', group: 'Community', icon: 'Icons/icons8-user-male-50.png', label: 'Star Author', desc: 'Gain 5,000 followers', hit: m => m.followers >= 5000 },
+  { key: 'celebrity', group: 'Community', icon: 'Icons/icons8-users-50.png', label: 'Celebrity', desc: 'Gain 10,000 followers', hit: m => m.followers >= 10000 },
+  { key: 'community_legend', group: 'Community', icon: 'Icons/icons8-user-male-50.png', label: 'Legend', desc: 'Gain 100,000 followers', hit: m => m.followers >= 100000 },
+  { key: 'supporter', group: 'Community', icon: 'Icons/icons8-thumbs-up-24.png', label: 'Supporter', desc: 'Favorite 50 stories', hit: m => m.likesGiven >= 50 },
+  { key: 'social_butterfly', group: 'Community', icon: 'Icons/person-plus.png', label: 'Social Butterfly', desc: 'Follow 50 authors', hit: m => m.following >= 50 },
+  { key: 'hello_world', group: 'Community', icon: 'Icons/icons8-comments-50.png', label: 'Hello, World', desc: 'Make your first comment', hit: m => m.commentsMade >= 1 },
+  { key: 'friendly_face', group: 'Community', icon: 'Icons/icons8-comments-50.png', label: 'Friendly Face', desc: 'Make 10 comments', hit: m => m.commentsMade >= 10 },
+  { key: 'critic', group: 'Community', icon: 'Icons/icons8-comments-50.png', label: 'Critic', desc: 'Leave 100 comments', hit: m => m.commentsMade >= 100 },
+  { key: 'community_pillar', group: 'Community', icon: 'Icons/icons8-thumbs-up-24.png', label: 'Community Pillar', desc: 'Receive 100 likes on your comments', hit: m => m.likesOnComments >= 100 },
+
+  // ---- Consistency (streaks / daily) ----
+  { key: 'first_step', group: 'Consistency', icon: 'Icons/icons8-plus-math-50.png', label: 'First Step', desc: 'Write on 2 different days', hit: m => m.writeDays >= 2 },
+  { key: 'keeping_it_up', group: 'Consistency', icon: 'Icons/alarm.png', label: 'Keeping It Up', desc: 'Write for 3 consecutive days', hit: m => m.streak >= 3 },
+  { key: 'on_a_roll', group: 'Consistency', icon: 'Icons/alarm.png', label: 'On a Roll', desc: 'Write for 7 consecutive days', hit: m => m.streak >= 7 },
+  { key: 'daily_grind', group: 'Consistency', icon: 'Icons/icons8-check-mark-50.png', label: 'Daily Grind', desc: 'Write every day for a week', hit: m => m.streak >= 7 },
+  { key: 'dedicated_con', group: 'Consistency', icon: 'Icons/alarm.png', label: 'Dedicated', desc: 'Write for 14 consecutive days', hit: m => m.streak >= 14 },
+  { key: 'unstoppable', group: 'Consistency', icon: 'Icons/alarm.png', label: 'Unstoppable', desc: 'Write for 30 consecutive days', hit: m => m.streak >= 30 },
+  { key: 'iron_will', group: 'Consistency', icon: 'Icons/rock.png', label: 'Iron Will', desc: 'Write for 60 consecutive days', hit: m => m.streak >= 60 },
+  { key: 'relentless', group: 'Consistency', icon: 'Icons/rock.png', label: 'Relentless', desc: 'Write for 100 consecutive days', hit: m => m.streak >= 100 },
+  { key: 'half_a_year', group: 'Consistency', icon: 'Icons/alarm.png', label: 'Half a Year', desc: 'Write for 180 consecutive days', hit: m => m.streak >= 180 },
+  { key: 'year_of_writing', group: 'Consistency', icon: 'Icons/alarm.png', label: 'Year of Writing', desc: 'Write for 365 consecutive days', hit: m => m.streak >= 365 },
+  { key: 'speed_writer', group: 'Consistency', icon: 'Icons/editpen.png', label: 'Speed Writer', desc: 'Write 2,000 words in one day', hit: m => m.topDay >= 2000 },
+  { key: 'word_rush', group: 'Consistency', icon: 'Icons/rock.png', label: 'Word Rush', desc: 'Write 5,000 words in 24 hours', hit: m => m.topDay >= 5000 },
+  { key: 'marathon_ch', group: 'Consistency', icon: 'Icons/rock.png', label: 'Marathon', desc: 'Write 10,000 words in 24 hours', hit: m => m.topDay >= 10000 },
+  { key: 'writing_frenzy', group: 'Consistency', icon: 'Icons/rock.png', label: 'Writing Frenzy', desc: 'Write 20,000 words in 24 hours', hit: m => m.topDay >= 20000 },
+  { key: 'grind_never_stops', group: 'Consistency', icon: 'Icons/social-media.png', label: 'The Grind Never Stops', desc: 'Write 10,000 words in one week', hit: m => m.weekWords >= 10000 },
+  { key: 'monthly_champion', group: 'Consistency', icon: 'Icons/vip-card.png', label: 'Monthly Champion', desc: 'Write 50,000 words in one month', hit: m => m.monthWords >= 50000 },
+  { key: 'monday_motivation', group: 'Consistency', icon: 'Icons/alarm.png', label: 'Monday Motivation', desc: 'Write on a Monday', hit: m => !!m.flags.monday },
+  { key: 'weekend_warrior', group: 'Consistency', icon: 'Icons/alarm.png', label: 'Weekend Warrior', desc: 'Write on a Saturday or Sunday', hit: m => !!m.flags.weekend },
+  { key: 'midnight_author', group: 'Consistency', icon: 'Icons/star.png', label: 'Midnight Author', desc: 'Write right after midnight', hit: m => !!m.flags.midnight },
+  { key: 'early_bird', group: 'Consistency', icon: 'Icons/alarm.png', label: 'Early Bird', desc: 'Write before 7 AM', hit: m => !!m.flags.earlybird },
+  { key: 'night_owl', group: 'Consistency', icon: 'Icons/alarm.png', label: 'Night Owl', desc: 'Write after 10 PM', hit: m => !!m.flags.nightowl },
+
+  // ---- Reading ----
+  { key: 'first_read', group: 'Reading', icon: 'Icons/open-book.png', label: 'First Read', desc: 'Read your first chapter', hit: m => m.reads >= 1 },
+  { key: 'bookworm', group: 'Reading', icon: 'Icons/open-book.png', label: 'Bookworm', desc: 'Read 10 chapters', hit: m => m.reads >= 10 },
+  { key: 'avid_reader', group: 'Reading', icon: 'Icons/open-book.png', label: 'Avid Reader', desc: 'Read 50 chapters', hit: m => m.reads >= 50 },
+  { key: 'dedicated_reader', group: 'Reading', icon: 'Icons/book.png', label: 'Dedicated Reader', desc: 'Read 100 chapters', hit: m => m.reads >= 100 },
+  { key: 'bibliophile', group: 'Reading', icon: 'Icons/book.png', label: 'Bibliophile', desc: 'Read 500 chapters', hit: m => m.reads >= 500 },
+  { key: 'voracious_reader', group: 'Reading', icon: 'Icons/book.png', label: 'Voracious Reader', desc: 'Read 1,000 chapters', hit: m => m.reads >= 1000 },
+  { key: 'library_devourer', group: 'Reading', icon: 'Icons/book.png', label: 'Library Devourer', desc: 'Read 5,000 chapters', hit: m => m.reads >= 5000 },
+  { key: 'story_explorer', group: 'Reading', icon: 'Icons/bookmark.png', label: 'Story Explorer', desc: 'Read 10 different novels', hit: m => m.booksRead >= 10 },
+  { key: 'genre_explorer', group: 'Reading', icon: 'Icons/bookmark.png', label: 'Genre Explorer', desc: 'Read in 5 different genres', hit: m => m.genresRead >= 5 },
+  { key: 'open_minded', group: 'Reading', icon: 'Icons/bookmark.png', label: 'Open-Minded', desc: 'Read in 10 different genres', hit: m => m.genresRead >= 10 },
+  { key: 'first_book_finished', group: 'Reading', icon: 'Icons/icons8-check-mark-50.png', label: 'First Book Finished', desc: 'Complete one novel', hit: m => m.booksCompleted >= 1 },
+  { key: 'serial_reader', group: 'Reading', icon: 'Icons/icons8-check-mark-50.png', label: 'Serial Reader', desc: 'Complete 5 novels', hit: m => m.booksCompleted >= 5 },
+  { key: 'book_collector', group: 'Reading', icon: 'Icons/icons8-check-mark-50.png', label: 'Book Collector', desc: 'Complete 10 novels', hit: m => m.booksCompleted >= 10 },
+  { key: 'grand_reader', group: 'Reading', icon: 'Icons/icons8-check-mark-50.png', label: 'Grand Reader', desc: 'Complete 50 novels', hit: m => m.booksCompleted >= 50 },
+
+  // ---- Publishing ----
+  { key: 'first_book', group: 'Publishing', icon: 'Icons/book.png', label: 'First Book', desc: 'Publish your first book', hit: m => m.myBooks.length >= 1 },
+  { key: 'second_story', group: 'Publishing', icon: 'Icons/book.png', label: 'Second Story', desc: 'Publish 2 stories', hit: m => m.myBooks.length >= 2 },
+  { key: 'three_books', group: 'Publishing', icon: 'Icons/books-stack-of-three.png', label: '3 Books', desc: 'Publish 3 books', hit: m => m.myBooks.length >= 3 },
+  { key: 'storyteller_pub', group: 'Publishing', icon: 'Icons/open-book.png', label: 'Storyteller', desc: 'Publish 5 stories', hit: m => m.myBooks.length >= 5 },
+  { key: 'five_books', group: 'Publishing', icon: 'Icons/books-stack-of-three.png', label: '5 Books', desc: 'Publish 5 books', hit: m => m.myBooks.length >= 5 },
+  { key: 'authors_shelf', group: 'Publishing', icon: 'Icons/books-stack-of-three.png', label: "Author's Shelf", desc: 'Publish 10 stories', hit: m => m.myBooks.length >= 10 },
+  { key: 'prolific_author', group: 'Publishing', icon: 'Icons/books-stack-of-three.png', label: 'Prolific Author', desc: 'Publish 25 stories', hit: m => m.myBooks.length >= 25 },
+  { key: 'library_owner', group: 'Publishing', icon: 'Icons/books-stack-of-three.png', label: 'Library Owner', desc: 'Publish 50 stories', hit: m => m.myBooks.length >= 50 },
+  { key: 'writing_empire', group: 'Publishing', icon: 'Icons/books-stack-of-three.png', label: 'Writing Empire', desc: 'Publish 100 stories', hit: m => m.myBooks.length >= 100 },
+  { key: 'published', group: 'Publishing', icon: 'Icons/open-book.png', label: 'Published', desc: 'Publish your first book', hit: m => m.pubBooks >= 1 },
+  { key: 'chapters_10', group: 'Publishing', icon: 'Icons/editpen.png', label: '10 Chapters', desc: 'Write 10 chapters', hit: m => m.chaptersTotal >= 10 },
+  { key: 'completed_work', group: 'Publishing', icon: 'Icons/icons8-check-mark-50.png', label: 'Completed Work', desc: 'Complete a book', hit: m => m.compBooks >= 1 },
+
+  // ---- Challenge (dynamic combos) ----
+  { key: 'triple_threat', group: 'Challenge', icon: 'Icons/star.png', label: 'Triple Threat', desc: 'Write 10,000 words + 1,000 views + 100 favorites', hit: m => m.wordsTotal >= 10000 && m.totalViews >= 1000 && m.totalLikes >= 100 },
+  { key: 'complete_package', group: 'Challenge', icon: 'Icons/star.png', label: 'Complete Package', desc: 'Publish 10 chapters + 1,000 views + 100 favorites', hit: m => m.pubChapters >= 10 && m.totalViews >= 1000 && m.totalLikes >= 100 },
+  { key: 'rising_author', group: 'Challenge', icon: 'Icons/rock.png', label: 'Rising Author', desc: 'Reach 10,000 words, 1,000 views and 100 followers', hit: m => m.wordsTotal >= 10000 && m.totalViews >= 1000 && m.followers >= 100 },
+  { key: 'established_author', group: 'Challenge', icon: 'Icons/diamond.png', label: 'Established Author', desc: 'Reach 50,000 words, 10,000 views and 1,000 favorites', hit: m => m.wordsTotal >= 50000 && m.totalViews >= 10000 && m.totalLikes >= 1000 },
+  { key: 'masterpiece', group: 'Challenge', icon: 'Icons/diamond.png', label: 'Masterpiece', desc: 'Complete a story with 100,000+ words', hit: m => m.myBooks.some(b => b.status === 'Completed' && (m.bookWords[b.id] || 0) >= 100000) },
+  { key: 'cult_classic', group: 'Challenge', icon: 'Icons/saturn.png', label: 'Cult Classic', desc: 'A completed story reaches 10,000 views', hit: m => m.myBooks.some(b => b.status === 'Completed' && (b.views || 0) >= 10000) },
+  { key: 'readers_choice', group: 'Challenge', icon: 'Icons/like.png', label: "Reader's Choice", desc: 'One story receives 1,000 favorites', hit: m => m.myBooks.some(b => (b.favorites || 0) >= 1000) },
+  { key: 'one_story_many_readers', group: 'Challenge', icon: 'Icons/view.png', label: 'One Story, Many Readers', desc: 'One story reaches 100,000 views', hit: m => m.myBooks.some(b => (b.views || 0) >= 100000) },
+  { key: 'empire_builder', group: 'Challenge', icon: 'Icons/books-stack-of-three.png', label: 'Empire Builder', desc: 'Have 10 stories each reach 1,000 views', hit: m => m.myBooks.filter(b => (b.views || 0) >= 1000).length >= 10 },
+  { key: 'authors_legacy', group: 'Challenge', icon: 'Icons/icons8-check-mark-50.png', label: "Author's Legacy", desc: 'Have 5 completed stories', hit: m => m.compBooks >= 5 },
+  { key: 'master_of_genres', group: 'Challenge', icon: 'Icons/bookmark.png', label: 'Master of Genres', desc: 'Publish stories in 5 different genres', hit: m => m.genresWritten >= 5 },
+  { key: 'the_full_journey', group: 'Challenge', icon: 'Icons/planet.png', label: 'The Full Journey', desc: 'Write, publish, complete and reach 10,000 views on one story', hit: m => m.myBooks.some(b => b.status === 'Completed' && (b.views || 0) >= 10000) },
+
+  // ---- Secret ----
+  { key: 'mystery_1', group: 'Secret', icon: 'Icons/diamond.png', label: 'Curious Mind', desc: 'Reach 500 EXP on your journey', mystery: true, hit: m => m.exp >= 500 },
+  { key: 'mystery_2', group: 'Secret', icon: 'Icons/saturn.png', label: 'Deep Reader', desc: 'Read 250 chapters across the platform', mystery: true, hit: m => m.reads >= 250 },
+  { key: 'mystery_3', group: 'Secret', icon: 'Icons/star.png', label: 'Noisy Neighbor', desc: 'Leave 25 comments', mystery: true, hit: m => m.commentsMade >= 25 },
+  { key: 'old_soul', group: 'Secret', icon: 'Icons/planet.png', label: 'Old Soul', desc: 'Maintain your account for one year', mystery: true, hit: m => m.joinAgeYears >= 1 },
+  { key: 'veteran_acc', group: 'Secret', icon: 'Icons/rock.png', label: 'Veteran', desc: 'Maintain your account for three years', mystery: true, hit: m => m.joinAgeYears >= 3 },
+];
+
+// Shared achievements computation
+function computeAchievements() {
+  if (!state.achievements) state.achievements = {};
+  const m = achievementMetrics();
+  let changed = false;
+  const all = ACHIEVEMENT_DEFS.map(d => {
+    const hit = d.hit(m);
+    if (hit && !state.achievements[d.key]) { state.achievements[d.key] = new Date().toISOString(); changed = true; }
+    const achieved = !!state.achievements[d.key];
+    const hidden = d.mystery && !achieved;
+    return {
+      key: d.key, group: d.group, icon: d.icon,
+      label: hidden ? '???' : d.label,
+      desc: hidden ? 'Secret achievement - keep doing what you love.' : d.desc,
+      date: state.achievements[d.key], achieved, mystery: d.mystery,
+    };
+  });
+  if (changed) saveState();
+  const achievements = all.filter(a => a.achieved);
+  const locked = all.filter(a => !a.achieved);
+  return { achievements, locked, all, myBooks: m.myBooks, totalViews: m.totalViews, totalFlames: m.totalFlames, pubBooks: m.pubBooks, compBooks: m.compBooks, metrics: m };
+}
 function fmt(n) { if (n >= 1e6) return (n/1e6).toFixed(1)+'M'; if (n >= 1e3) return (n/1e3).toFixed(1)+'K'; return ''+n; }
 function coverColor(title) {
   const colors = ['#1a1a1a,#000000','#2a2a2a,#0a0a0a','#222222,#000000','#333333,#111111','#1a1a1a,#0a0a0a','#2a2a2a,#000000','#111111,#000000','#252525,#050505','#1e1e1e,#000000','#2e2e2e,#080808'];
@@ -439,6 +823,127 @@ function imageBg(url, fallback) { return url ? `background-image:url('${cssUrl(u
 function imageClass(base, url) { return `${base}${url ? ' has-img' : ''}`; }
 function coverClass(base, url) { return `${base}${url ? ' has-cover' : ''}`; }
 function imageFallback(text) { return (text || '?').trim().slice(0, 1).toUpperCase() || '?'; }
+
+function escHtml(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+const CONTENT_IMG_RE = /(^|\s)(https?:\/\/[^\s]+?\.(?:png|jpe?g|gif|webp|bmp|svg|avif|ico)(?:\?[^\s]*)?)/gi;
+
+function renderRichContent(text) {
+  if (!text) return '';
+  let html = escHtml(text);
+
+  // Convert image URLs to zoomable <img> elements
+  html = html.replace(CONTENT_IMG_RE, (m, pre, url) => {
+    const clean = url.replace(/&amp;/g, '&');
+    return `${pre}<img src="${cssUrl(clean)}" class="reader-img" loading="lazy" alt="reader image" data-zoom-src="${cssUrl(clean)}">`;
+  });
+
+  // Bold then italic (order matters so bold segments can contain italics)
+  html = html.replace(/\*\*(.+?)\*\*/gs, '<strong>$1</strong>');
+  html = html.replace(/__(.+?)__/gs, '<strong>$1</strong>');
+  html = html.replace(/\*([^*]+?)\*/gs, '<em>$1</em>');
+
+  return html;
+}
+
+// Split chapter content into paragraphs on double newlines (preserves single newlines).
+function chapterBlocks(content) {
+  if (!content) return [];
+  return String(content).split(/\r?\n\s*\r?\n/).map(b => b.trim()).filter(Boolean);
+}
+
+// Render a single paragraph with its inline comment marker + passage highlights.
+function paragraphHtml(bookId, chapterId, block, paraIdx) {
+  const book = getBook(bookId);
+  const isAuthor = state.loggedIn && !!book && book.author === state.user.username;
+  const marker = isAuthor
+    ? `<span class="para-marker" data-para="${paraIdx}" data-book="${bookId}" data-chapter="${chapterId}" title="Comment on this paragraph">+${getChapterComments(bookId, chapterId).filter(c => c.para === paraIdx).length || ''}</span>`
+    : '';
+  return `<p class="reader-para" data-para="${paraIdx}">${marker}${highlightBlockHtml(bookId, chapterId, block, paraIdx)}</p>`;
+}
+
+// Tokenize a paragraph's raw text the same way renderRichContent does, so we can
+// map visible-text offsets back to raw block offsets for passage highlights.
+function segmentBlock(block) {
+  const segs = [];
+  let pos = 0, start = 0;
+  const n = block.length;
+  const push = (bStart, bEnd, kind) => {
+    if (bEnd <= bStart) return;
+    const span = bEnd - bStart;
+    if (kind === 'img') { segs.push({ bStart, bEnd, kind, plen: 0, bpre: 0 }); return; }
+    const drop = kind === 'strong' ? 4 : 2;
+    segs.push({ bStart, bEnd, kind, plen: Math.max(0, span - drop), bpre: kind === 'strong' ? 2 : 1 });
+  };
+  const imgEndAt = (j) => {
+    if (j > 0 && !/\s/.test(block[j - 1])) return null;
+    const m = block.slice(j).match(/^(https?:\/\/)([^\s]+?)\.(png|jpe?g|gif|webp|bmp|svg|avif|ico)(\?[^\s]*)?/i);
+    return m ? j + m[0].length : null;
+  };
+  while (pos < n) {
+    let tok = null;
+    if (block.startsWith('**', pos)) { const e = block.indexOf('**', pos + 2); if (e > pos + 2) tok = { end: e + 2, kind: 'strong' }; }
+    if (!tok && block.startsWith('__', pos)) { const e = block.indexOf('__', pos + 2); if (e > pos + 2) tok = { end: e + 2, kind: 'strong' }; }
+    if (!tok && block[pos] === '*') { const e = block.indexOf('*', pos + 1); if (e > pos + 1) tok = { end: e + 1, kind: 'em' }; }
+    if (!tok) { const ie = imgEndAt(pos); if (ie) tok = { end: ie, kind: 'img' }; }
+    if (!tok) { pos++; continue; }
+    if (pos > start) push(start, pos, 'text');
+    push(pos, tok.end, tok.kind);
+    pos = tok.end; start = pos;
+  }
+  if (pos > start) push(start, pos, 'text');
+  return segs;
+}
+
+function buildPlainMap(block, segs) {
+  const p2b = [0];
+  for (const sg of segs) {
+    if (sg.kind === 'img') continue;
+    const tStart = sg.bStart + sg.bpre;
+    for (let i = 1; i <= sg.plen; i++) p2b.push(tStart + i);
+  }
+  return p2b;
+}
+
+function highlightBlockHtml(bookId, chapterId, block, paraIdx) {
+  const hls = getChapterHighlights(bookId, chapterId).filter(h => h.para === paraIdx).sort((a, b) => a.start - b.start);
+  if (!hls.length) return renderRichContent(block);
+  const p2b = buildPlainMap(block, segmentBlock(block));
+  if (!p2b.length) return renderRichContent(block);
+  let out = '';
+  let lastB = 0;
+  for (const h of hls) {
+    const bs = p2b[h.start], be = p2b[h.end];
+    if (h.start < 0 || h.end >= p2b.length || bs < lastB || be <= bs) continue;
+    const n = (h.comments || []).length;
+    out += renderRichContent(block.slice(lastB, bs));
+    out += `<mark class="hl" data-hl="${h.id}" data-book="${bookId}" data-chapter="${chapterId}" data-para="${paraIdx}" title="${n} comment${n === 1 ? '' : 's'} on this passage">${renderRichContent(block.slice(bs, be))}${n ? `<span class="hl-badge">${n}</span>` : ''}</mark>`;
+    lastB = be;
+  }
+  out += renderRichContent(block.slice(lastB));
+  return out;
+}
+
+// Build pages of paragraphs (character-based chunking) for page-by-page mode.
+function paginateBlocks(blocks, pageChars) {
+  const cap = pageChars || 1600;
+  const pages = [];
+  let cur = [], curLen = 0;
+  blocks.forEach(b => {
+    const len = b.length;
+    if (cur.length && curLen + len > cap) {
+      pages.push(cur);
+      cur = [];
+      curLen = 0;
+    }
+    cur.push(b);
+    curLen += len;
+  });
+  if (cur.length) pages.push(cur);
+  return pages.length ? pages : [[]];
+}
 function bindImageErrorLogging() {
   document.querySelectorAll('[data-img-url]').forEach(el => {
     const url = el.dataset.imgUrl;
@@ -543,6 +1048,8 @@ function createChapter(bookId, data) {
     book.chapterCount = chapters.length;
     book.updatedAt = today();
   }
+  const newWords = countWords(chapter.content);
+  if (newWords > 0) trackWrite(newWords);
   saveState();
   syncCreateChapter(bookId, chapter);
   return chapter;
@@ -552,6 +1059,10 @@ function updateChapter(bookId, chapterId, data) {
   const chapters = state.chapters[bookId] || [];
   const ch = chapters.find(c => c.id === chapterId);
   if (!ch) return;
+  if (data.content !== undefined && data.content !== ch.content) {
+    const delta = countWords(data.content) - countWords(ch.content);
+    if (delta > 0) trackWrite(delta);
+  }
   Object.assign(ch, data, { updatedAt: today() });
   saveState();
   syncUpdateChapter(chapterId, data);
@@ -570,11 +1081,24 @@ function deleteChapter(bookId, chapterId) {
 
 function createCharacter(bookId, data) {
   const chars = state.characters[bookId] || [];
-  const ch = { id: genId(), bookId, name: data.name, role: data.role || '', description: data.description || '', image: data.image || '' };
+  const ch = { id: genId(), bookId, name: data.name, nickname: data.nickname || '', age: data.age || '', height: data.height || '', weight: data.weight || '', description: data.description || '', role: data.role || '', image: data.image || '' };
   chars.push(ch);
   state.characters[bookId] = chars;
   saveState();
   syncCreateCharacter(bookId, ch);
+  return ch;
+}
+
+function updateCharacter(bookId, charId, data) {
+  const ch = (state.characters[bookId] || []).find(c => c.id === charId);
+  if (!ch) return;
+  Object.assign(ch, {
+    name: data.name, nickname: data.nickname || '', age: data.age || '', height: data.height || '',
+    weight: data.weight || '', description: data.description || '', role: data.role || '',
+    image: data.image !== undefined ? data.image : ch.image,
+  });
+  saveState();
+  syncUpdateCharacter(ch.serverId || ch.id, ch);
   return ch;
 }
 
@@ -606,14 +1130,18 @@ function giveFlames(bookId) {
 
   // Try server first
   if (serverOnline) {
-    syncGiveFlame(bookId).then(res => {
-      if (res) {
-        state.flamesRemaining = res.remaining;
-        book.flames = res.bookFlames;
-        if (res.expReward) applyExpReward(res.expReward);
-        saveState();
-        render();
-      }
+    const maxF = dailyFlameAllowance(state.user.level || 1);
+    const rem = state.flamesRemaining ?? maxF;
+    if (rem <= 0) return false;
+    syncGiveFlame(bookId, rem).then(res => {
+      if (!res) return;
+      const given = res.given || 1;
+      state.flamesRemaining = res.remaining;
+      book.flames = res.bookFlames;
+      recordSupporter(book, given);
+      if (res.expReward) applyExpReward(res.expReward);
+      saveState();
+      render();
     });
     return true;
   }
@@ -634,18 +1162,36 @@ function giveFlames(bookId) {
   state.flames[bookId] += remaining;
   book.flames = (book.flames || 0) + remaining;
   state.flamesGiven += remaining;
+  recordSupporter(book, remaining);
   gainExp(remaining * 10, 'flame');
   saveState();
   return true;
 }
 
-function recordView(bookId) {
+// Keep the Supporters feed in sync with flames given
+function recordSupporter(book, amount) {
+  if (!book || !amount) return;
+  if (!state.supporterHistory) state.supporterHistory = [];
+  state.supporterHistory.push({ user: state.user.username, book: book.title, amount, date: new Date().toISOString() });
+}
+
+function recordView(bookId, chapterId) {
   const book = getBook(bookId);
   if (!book) return;
-  book.views = (book.views || 0) + 1;
   const d = new Date().toISOString().split('T')[0];
+  const key = bookId + '_' + (chapterId || '') + '_' + d;
+  if (!state._viewCache) state._viewCache = {};
+  if (state._viewCache[key]) return;
+  state._viewCache[key] = true;
+  if (chapterId) {
+    // Opening a chapter counts toward the reading achievements
+    state.readsTotal = (state.readsTotal || 0) + 1;
+    const ch = (state.chapters[bookId] || []).find(c => c.id === chapterId);
+    if (ch) ch.views = (ch.views || 0) + 10;
+  }
+  book.views = (book.views || 0) + 10;
   if (!book.dailyViews) book.dailyViews = {};
-  book.dailyViews[d] = (book.dailyViews[d] || 0) + 1;
+  book.dailyViews[d] = (book.dailyViews[d] || 0) + 10;
   saveState();
   syncRecordView(bookId);
 }
@@ -655,12 +1201,15 @@ function getReviews(bookId) { return state.reviews[bookId] || []; }
 
 function createReview(bookId, data) {
   const reviews = getReviews(bookId);
-  const r = { id: genId(), bookId, username: state.user.username, content: data.content, createdAt: new Date().toLocaleDateString(), editedAt: null, pinned: false, favorited: false };
+  const ratings = {};
+  REVIEW_CATEGORIES.forEach(c => { ratings[c.key] = clampStar(data.ratings ? data.ratings[c.key] : 5); });
+  const overall = ratingOverall(ratings);
+  const r = { id: genId(), bookId, username: state.user.username, content: data.content, ratings, rating: overall, createdAt: new Date().toLocaleDateString(), editedAt: null, pinned: false, favorited: false };
   reviews.push(r);
   state.reviews[bookId] = reviews;
   saveState();
   if (serverOnline) {
-    syncCreateReview(bookId, data).then(res => {
+    syncCreateReview(bookId, { ...data, ratings, rating: overall }).then(res => {
       if (!res) return;
       Object.assign(r, res);
       if (res.expReward) applyExpReward(res.expReward);
@@ -716,6 +1265,14 @@ function replyToReview(bookId, reviewId, content) {
   r.replies.push({ id: genId(), username: state.user.username, content, createdAt: new Date().toLocaleDateString() });
   state.reviews[bookId] = reviews;
   saveState();
+
+  // Notify the review author (unless it's our own review)
+  if (r.username && r.username !== state.user.username) {
+    const book = getBook(bookId);
+    const target = `${book ? book.title : 'book'} review`;
+    const link = `#/book/${bookId}`;
+    addInboxMessage(state.user.username, r.username, content, r.content, target, link);
+  }
 }
 
 // ---- Chapter Comment CRUD ----
@@ -723,10 +1280,11 @@ function getChapterComments(bookId, chapterId) {
   const key = bookId + '_' + chapterId;
   return state.chapterComments[key] || [];
 }
-function createChapterComment(bookId, chapterId, content) {
+function createChapterComment(bookId, chapterId, content, para) {
   const key = bookId + '_' + chapterId;
   if (!state.chapterComments[key]) state.chapterComments[key] = [];
   const c = { id: genId(), username: state.user.username, content, createdAt: new Date().toLocaleDateString() };
+  if (para !== undefined && para !== null) c.para = para;
   state.chapterComments[key].push(c);
   saveState();
   if (serverOnline) {
@@ -749,21 +1307,429 @@ function deleteChapterComment(bookId, chapterId, commentId) {
   syncDeleteComment(commentId);
 }
 
+function toggleChapterCommentLike(bookId, chapterId, commentId) {
+  if (!state.loggedIn) { navigate('#/signin'); return; }
+  const key = bookId + '_' + chapterId;
+  const comments = state.chapterComments[key] || [];
+  const c = comments.find(x => x.id === commentId);
+  if (!c) return;
+  if (!c.likes) c.likes = [];
+  const i = c.likes.indexOf(state.user.username);
+  if (i >= 0) c.likes.splice(i, 1); else c.likes.push(state.user.username);
+  state.chapterComments[key] = comments;
+  saveState();
+}
+
+function toggleReviewLike(bookId, reviewId) {
+  if (!state.loggedIn) { navigate('#/signin'); return; }
+  const reviews = getReviews(bookId);
+  const r = reviews.find(x => x.id === reviewId);
+  if (!r) return;
+  if (!r.likes) r.likes = [];
+  const i = r.likes.indexOf(state.user.username);
+  if (i >= 0) r.likes.splice(i, 1); else r.likes.push(state.user.username);
+  state.reviews[bookId] = reviews;
+  saveState();
+}
+
+// ---- Passage Highlight CRUD (readers select text -> comment on it) ----
+function getChapterHighlights(bookId, chapterId) {
+  const key = bookId + '_' + chapterId;
+  return state.chapterHighlights[key] || [];
+}
+
+function getAllBookHighlights(bookId) {
+  return (state.chapters[bookId] || []).reduce((acc, ch) => {
+    const hls = getChapterHighlights(bookId, ch.id);
+    if (hls.length) acc.push({ chapter: ch, highlights: hls });
+    return acc;
+  }, []);
+}
+
+function createHighlight(bookId, chapterId, h) {
+  if (!state.loggedIn) { navigate('#/signin'); return null; }
+  const key = bookId + '_' + chapterId;
+  if (!state.chapterHighlights[key]) state.chapterHighlights[key] = [];
+  const list = state.chapterHighlights[key];
+  const cc = String(h.content || '').trim().slice(0, 800);
+  if (!cc) return null;
+  const existing = list.find(x => x.para === h.para && x.start === h.start && x.end === h.end);
+  const comment = { id: genId(), username: state.user.username, content: cc, createdAt: new Date().toLocaleDateString() };
+  if (existing) {
+    existing.comments.push(comment);
+    saveState();
+    return existing;
+  }
+  const rec = { id: genId(), para: h.para, start: h.start, end: h.end, text: String(h.text || '').trim().slice(0, 300), comments: [comment] };
+  list.push(rec);
+  saveState();
+  return rec;
+}
+
+function createHighlightComment(bookId, chapterId, hlId, content) {
+  const key = bookId + '_' + chapterId;
+  const list = state.chapterHighlights[key] || [];
+  const rec = list.find(x => x.id === hlId);
+  if (!rec) return null;
+  const cc = String(content || '').trim().slice(0, 800);
+  if (!cc) return null;
+  rec.comments.push({ id: genId(), username: state.user.username, content: cc, createdAt: new Date().toLocaleDateString() });
+  saveState();
+  return rec;
+}
+
+function deleteHighlightComment(bookId, chapterId, hlId, commentId) {
+  const key = bookId + '_' + chapterId;
+  const list = state.chapterHighlights[key] || [];
+  const rec = list.find(x => x.id === hlId);
+  if (!rec) return;
+  rec.comments = (rec.comments || []).filter(c => c.id !== commentId);
+  if (!rec.comments.length) state.chapterHighlights[key] = list.filter(x => x.id !== hlId);
+  saveState();
+}
+
+function deleteHighlightRecord(bookId, chapterId, hlId) {
+  const key = bookId + '_' + chapterId;
+  state.chapterHighlights[key] = (state.chapterHighlights[key] || []).filter(x => x.id !== hlId);
+  saveState();
+}
+
+function replaceParagraph(paraEl, bookId, chapterId, para) {
+  const ch = (state.chapters[bookId] || []).find(c => c.id === chapterId);
+  if (!ch) return;
+  const blocks = chapterBlocks(ch.content);
+  const block = blocks[para];
+  if (block === undefined) return;
+  paraEl.outerHTML = paragraphHtml(bookId, chapterId, block, para);
+}
+
+// ---- Reader: selection -> passage comment popup ----
+let _sel = null;
+
+function closestParaEl(node) {
+  let n = node && node.nodeType === 3 ? node.parentElement : node;
+  while (n && !(n.classList && n.classList.contains('reader-para'))) n = n.parentElement;
+  return n;
+}
+
+function domOffsetInto(root, target, offset) {
+  let acc = 0;
+  if (root === target) {
+    for (let i = 0; i < (offset || 0) && root.childNodes && i < root.childNodes.length; i++) {
+      const ch = root.childNodes[i];
+      acc += (ch.textContent ? ch.textContent.length : 0);
+    }
+    return acc;
+  }
+  (function rec(n) {
+    if (n === target) return true;
+    if (n.nodeType === 3) { acc += (n.textContent || '').length; return false; }
+    if (n.nodeType === 1 && n.childNodes) {
+      for (let i = 0; i < n.childNodes.length; i++) {
+        if (rec(n.childNodes[i])) return true;
+      }
+    }
+    return false;
+  })(root);
+  return acc + (offset || 0);
+}
+
+function showSelPop(rect) {
+  if (typeof document === 'undefined') return;
+  let pop = document.getElementById('sel-popup');
+  if (!pop) {
+    pop = document.createElement('div');
+    pop.id = 'sel-popup';
+    pop.className = 'sel-popup';
+    if (document.body.appendChild) document.body.appendChild(pop);
+  }
+  if (!pop) return;
+  pop.innerHTML = '<div class="sel-row"><button class="btn btn-sm sel-comment-btn">Comment</button><button class="btn btn-sm sel-cancel" title="Close" style="padding:2px 7px">&#215;</button></div>';
+  pop.style.display = 'flex';
+  const pw = pop.offsetWidth || 150;
+  const ph = pop.offsetHeight || 34;
+  const vw = (typeof window !== 'undefined' && window.innerWidth) || 800;
+  let left = (rect ? rect.left + rect.width / 2 : 0) - (pw / 2);
+  let top = rect ? rect.top - ph - 8 : 0;
+  left = Math.max(8, Math.min(left, vw - pw - 8));
+  if (top < 8) top = rect ? rect.bottom + 8 : 8;
+  pop.style.left = left + 'px';
+  pop.style.top = top + 'px';
+}
+
+function hideSelPop() {
+  if (typeof document === 'undefined') return;
+  const pop = document.getElementById('sel-popup');
+  if (pop) pop.style.display = 'none';
+}
+
+function selOpenForm() {
+  const pop = document.getElementById('sel-popup');
+  if (!pop || !_sel) return;
+  if (!state.loggedIn) { hideSelPop(); clearSelection(); navigate('#/signin'); return; }
+  pop.style.width = '260px';
+  pop.innerHTML = `
+    <form class="sel-form">
+      <div class="sel-quote">&#8220;${escHtml(_sel.text)}&#8221;</div>
+      <textarea class="input-field" name="content" rows="2" placeholder="Comment on this passage..." style="font-size:0.68rem;width:100%;box-sizing:border-box;resize:none"></textarea>
+      <div class="sel-form-actions">
+        <button type="submit" class="btn btn-primary btn-sm" style="font-size:0.6rem;padding:4px 10px">Post Comment</button>
+        <button type="button" class="btn btn-sm sel-cancel" style="font-size:0.6rem;padding:4px 10px">Cancel</button>
+      </div>
+    </form>`;
+  const ta = pop.querySelector('textarea');
+  if (ta) ta.focus();
+}
+
+function submitSelForm(form) {
+  if (!state.loggedIn) { hideSelPop(); clearSelection(); navigate('#/signin'); return; }
+  if (!_sel) return;
+  const ta = form.querySelector('[name="content"]');
+  const content = (ta && ta.value.trim()) || '';
+  if (!content) return;
+  const selInfo = { bookId: _sel.bookId, chapterId: _sel.chapterId, para: _sel.para };
+  const rec = createHighlight(selInfo.bookId, selInfo.chapterId, { para: _sel.para, start: _sel.start, end: _sel.end, text: _sel.text, content });
+  hideSelPop();
+  clearSelection();
+  if (rec) {
+    const paraEl = document.querySelector('.reader-para[data-para="' + rec.para + '"]');
+    if (paraEl) replaceParagraph(paraEl, selInfo.bookId, selInfo.chapterId, rec.para);
+    else render();
+  } else {
+    render();
+  }
+}
+
+function clearSelection() {
+  const sel = (typeof window !== 'undefined' && window.getSelection) ? window.getSelection() : null;
+  if (sel && sel.removeAllRanges) { try { sel.removeAllRanges(); } catch (e) {} }
+  _sel = null;
+}
+
+// ---- Reader: paragraph-comment modal (module-level, works across re-renders) ----
+function openParaModal(bookId, chapterId, para) {
+  const modal = document.getElementById('para-comment-modal');
+  if (!modal) return;
+  if (!state.loggedIn) { navigate('#/signin'); return; }
+  modal.dataset.book = bookId;
+  modal.dataset.chapter = chapterId;
+  modal.dataset.para = para;
+  fillParaModal(bookId, chapterId, para);
+  modal.style.display = 'flex';
+}
+
+function closeParaModal() {
+  const modal = document.getElementById('para-comment-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+function fillParaModal(bookId, chapterId, para) {
+  const body = document.getElementById('para-body');
+  if (!body) return;
+  const book = getBook(bookId);
+  const list = getChapterComments(bookId, chapterId).filter(c => c.para === para);
+  body.innerHTML = list.length
+    ? list.map(c => paraCommentRowHtml(c, bookId, chapterId, book ? book.author : '')).join('')
+    : '<p style="font-size:0.65rem;color:var(--text3);text-align:center;padding:12px 0">No comments on this paragraph yet.</p>';
+}
+
+function refreshParaBadges(bookId, chapterId) {
+  document.querySelectorAll('.reader-para').forEach(p => {
+    const para = +p.dataset.para;
+    const n = getChapterComments(bookId, chapterId).filter(c => c.para === para).length;
+    const m = p.querySelector('.para-marker');
+    if (m) m.textContent = '+' + (n || '');
+  });
+}
+
+function submitParaForm(form) {
+  const modal = document.getElementById('para-comment-modal');
+  const ta = form.querySelector('[name="content"]');
+  const content = (ta && ta.value.trim()) || '';
+  if (!content) return;
+  const b = modal.dataset.book, ch = modal.dataset.chapter, p = +modal.dataset.para;
+  createChapterComment(b, ch, content, p);
+  ta.value = '';
+  fillParaModal(b, ch, p);
+  refreshParaBadges(b, ch);
+}
+
+// ---- Reader: passage-highlight modal ----
+function openHlModal(bookId, chapterId, hlId) {
+  const modal = document.getElementById('hl-modal');
+  if (!modal) return;
+  modal.dataset.book = bookId;
+  modal.dataset.chapter = chapterId;
+  modal.dataset.hl = hlId;
+  fillHlModal(bookId, chapterId, hlId);
+  modal.style.display = 'flex';
+}
+
+function closeHlModal() {
+  const modal = document.getElementById('hl-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+function fillHlModal(bookId, chapterId, hlId) {
+  const quoteEl = document.getElementById('hl-quote');
+  const body = document.getElementById('hl-body');
+  if (!body) return;
+  const rec = getChapterHighlights(bookId, chapterId).find(h => h.id === hlId);
+  if (!rec) {
+    if (quoteEl) quoteEl.textContent = '';
+    body.innerHTML = '<p style="font-size:0.65rem;color:var(--text3);text-align:center;padding:12px 0">This highlight no longer exists.</p>';
+    return;
+  }
+  if (quoteEl) quoteEl.textContent = '\u201c' + (rec.text || '') + '\u201d';
+  const book = getBook(bookId);
+  const bookAuthor = book ? book.author : '';
+  body.innerHTML = (rec.comments || []).length
+    ? rec.comments.map(c => {
+        const canMod = state.loggedIn && (c.username === state.user.username || bookAuthor === state.user.username);
+        return `
+        <div class="ch-comment-item">
+          <span class="ch-comment-avatar">${escHtml(String(c.username || '?')[0])}</span>
+          <div class="ch-comment-body">
+            <span class="ch-comment-author">${escHtml(c.username)}</span>
+            <span class="ch-comment-date">${c.createdAt}</span>
+            <p class="ch-comment-text">${escHtml(c.content)}</p>
+          </div>
+          ${canMod ? `<button class="btn btn-sm hl-del" data-book="${bookId}" data-chapter="${chapterId}" data-hl="${hlId}" data-para="${rec.para}" data-comment="${c.id}" style="font-size:0.5rem;padding:2px 6px;color:var(--red);flex-shrink:0">Delete</button>` : ''}
+        </div>`;
+      }).join('')
+    : '<p style="font-size:0.65rem;color:var(--text3);text-align:center;padding:12px 0">No comments on this passage yet.</p>';
+}
+
+function submitHlForm(form) {
+  if (!state.loggedIn) { navigate('#/signin'); return; }
+  const modal = form.closest ? form.closest('#hl-modal') : null;
+  const bookId = (modal ? modal.dataset.book : null) || form.dataset.book;
+  const chapterId = (modal ? modal.dataset.chapter : null) || form.dataset.chapter;
+  const hlId = (modal ? modal.dataset.hl : null) || form.dataset.hl;
+  if (!bookId || !chapterId || !hlId) return;
+  const ta = form.querySelector('[name="content"]');
+  const content = (ta && ta.value.trim()) || '';
+  if (!content) return;
+  const rec = createHighlightComment(bookId, chapterId, hlId, content);
+  if (!rec) return;
+  ta.value = '';
+  fillHlModal(bookId, chapterId, hlId);
+  const paraEl = document.querySelector('.reader-para[data-para="' + rec.para + '"]');
+  if (paraEl) replaceParagraph(paraEl, bookId, chapterId, rec.para);
+}
+
+// ---- Delegated reader/annotation events (bind once) ----
+if (!window._flowAnnotationBound) {
+  window._flowAnnotationBound = true;
+  document.addEventListener('click', e => {
+    const m = e.target.closest('.para-marker');
+    if (m) { e.preventDefault(); e.stopPropagation(); openParaModal(m.dataset.book, m.dataset.chapter, +m.dataset.para); return; }
+    const h = e.target.closest('.hl');
+    if (h) { e.preventDefault(); e.stopPropagation(); openHlModal(h.dataset.book, h.dataset.chapter, h.dataset.hl); return; }
+    if (e.target.closest('.hl-close') || e.target.closest('.hl-overlay')) { closeHlModal(); return; }
+    if (e.target.closest('.para-close') || e.target.closest('.para-overlay')) { closeParaModal(); return; }
+    const plike = e.target.closest('.para-like');
+    if (plike) { toggleChapterCommentLike(plike.dataset.book, plike.dataset.chapter, plike.dataset.comment); fillParaModal(plike.dataset.book, plike.dataset.chapter, +plike.dataset.para); return; }
+    const pdel = e.target.closest('.para-comment-del');
+    if (pdel) {
+      e.preventDefault();
+      if (!confirm('Delete this comment?')) return;
+      deleteChapterComment(pdel.dataset.book, pdel.dataset.chapter, pdel.dataset.comment);
+      fillParaModal(pdel.dataset.book, pdel.dataset.chapter, +pdel.dataset.para);
+      refreshParaBadges(pdel.dataset.book, pdel.dataset.chapter);
+      return;
+    }
+    const hld = e.target.closest('.hl-del');
+    if (hld) {
+      e.preventDefault();
+      if (!confirm('Delete this comment?')) return;
+      deleteHighlightComment(hld.dataset.book, hld.dataset.chapter, hld.dataset.hl, hld.dataset.comment);
+      fillHlModal(hld.dataset.book, hld.dataset.chapter, hld.dataset.hl);
+      const paraEl = document.querySelector('.reader-para[data-para="' + hld.dataset.para + '"]');
+      if (paraEl) replaceParagraph(paraEl, hld.dataset.book, hld.dataset.chapter, +hld.dataset.para);
+      return;
+    }
+    const hlrec = e.target.closest('.hl-del-rec');
+    if (hlrec) {
+      e.preventDefault();
+      if (!confirm('Delete this highlighted passage and all its comments?')) return;
+      deleteHighlightRecord(hlrec.dataset.book, hlrec.dataset.chapter, hlrec.dataset.hl);
+      closeHlModal();
+      render();
+      return;
+    }
+    const sbtn = e.target.closest('.sel-comment-btn');
+    if (sbtn) { e.preventDefault(); e.stopPropagation(); selOpenForm(); return; }
+    if (e.target.closest('.sel-cancel') || e.target.closest('.sel-x')) { hideSelPop(); clearSelection(); return; }
+    if (e.target.closest('.sel-form')) return;
+    if (_sel && !e.target.closest('#sel-popup')) { hideSelPop(); }
+  });
+  document.addEventListener('submit', e => {
+    const pf = e.target.closest('.para-form');
+    if (pf) { e.preventDefault(); submitParaForm(pf); return; }
+    const sf = e.target.closest('.sel-form');
+    if (sf) { e.preventDefault(); submitSelForm(sf); return; }
+    const hf = e.target.closest('.hl-form');
+    if (hf) { e.preventDefault(); submitHlForm(hf); return; }
+  });
+}
+
+// Deliver an inbox message to a user
+function addInboxMessage(from, to, text, quote, target, link) {
+  if (!state.messages) state.messages = [];
+  state.messages.push({
+    id: 'm' + Date.now() + Math.floor(Math.random()*999),
+    from, to, text, quote: quote || '', target: target || '', link: link || '#/inbox',
+    date: new Date().toISOString(), read: false
+  });
+  saveState();
+}
+
+function replyToChapterComment(bookId, chapterId, commentId, content) {
+  const key = bookId + '_' + chapterId;
+  const comments = state.chapterComments[key] || [];
+  const c = comments.find(x => x.id === commentId);
+  if (!c) return null;
+  if (!c.replies) c.replies = [];
+  const reply = { id: genId(), username: state.user.username, content, createdAt: new Date().toLocaleDateString() };
+  c.replies.push(reply);
+  state.chapterComments[key] = comments;
+  saveState();
+
+  // Notify the original comment author (unless it's our own comment)
+  if (c.username && c.username !== state.user.username) {
+    const book = getBook(bookId);
+    const ch = (state.chapters[bookId] || []).find(x => x.id === chapterId);
+    const target = `${book ? book.title : 'book'} \u00b7 Ch.${ch ? ch.chapterNumber : ''}`;
+    const link = `#/book/${bookId}/read/${chapterId}`;
+    addInboxMessage(state.user.username, c.username, content, c.content, target, link);
+  }
+  if (serverOnline) {
+    syncCreateComment(chapterId, content).then(() => render());
+  } else {
+    gainExp(10, 'comment');
+  }
+  return reply;
+}
+
 function giveSingleFlame(bookId) {
   const book = getBook(bookId);
   if (!book || book.author === state.user.username) return false;
 
   if (serverOnline) {
+    const maxF = dailyFlameAllowance(state.user.level || 1);
+    if ((state.flamesRemaining ?? maxF) <= 0) return false;
     const ch = state.chapters[bookId];
     const chId = ch && ch.length ? ch[ch.length-1].id : '';
     const endpoint = chId ? syncGiveSingleFlame(chId) : syncGiveFlame(bookId);
     endpoint.then(res => {
       if (!res) return;
+      const given = res.given || 1;
       state.flamesRemaining = res.remaining;
       book.flames = res.bookFlames;
+      recordSupporter(book, given);
       if (res.expReward) applyExpReward(res.expReward);
       saveState();
-      render();
     });
     return true;
   }
@@ -777,6 +1743,7 @@ function giveSingleFlame(bookId) {
   state.flames[bookId] += 1;
   book.flames = (book.flames || 0) + 1;
   state.flamesGiven += 1;
+  recordSupporter(book, 1);
   gainExp(10, 'flame');
   saveState();
   return true;
@@ -816,6 +1783,8 @@ function render() {
     if (parts[4] === 'editor') mainContent = renderEditor(id, parts[5]);
     else if (parts[4] === 'chapters' && parts[5] === 'new') mainContent = renderCreateChapter(id);
     else if (parts[4] === 'characters' && parts[5] === 'new') mainContent = renderCreateCharacter(id);
+    else if (parts[4] === 'characters' && parts[5]) mainContent = renderEditCharacter(id, parts[5]);
+    else if (parts[4] === 'highlights') mainContent = renderHighlightsPage(id);
     else mainContent = renderWorkspaceBook(id);
   } else if (route === '/explore' || route === '/explore/novel') mainContent = renderExplore('Novel');
   else if (route === '/explore/fanfic') mainContent = renderExplore('Fanfic');
@@ -828,9 +1797,16 @@ function render() {
   else if (route === '/profile/edit') mainContent = renderEditProfile();
   else if (route === '/profile/author') mainContent = renderAuthorProfile();
   else if (route === '/profile/themes') mainContent = renderThemes();
+  else if (route === '/inbox') mainContent = renderInbox();
   else if (route.startsWith('/book/') && route.includes('/read/')) {
     const parts = route.split('/');
     mainContent = renderChapterReader(parts[2], parts[4]);
+  } else if (route.startsWith('/book/') && route.split('/').length >= 5 && route.split('/')[3] === 'character') {
+    const parts = route.split('/');
+    mainContent = renderCharacterPage(parts[2], parts[4]);
+  } else if (route.startsWith('/book/') && route.split('/')[3] === 'comments' && route.split('/').length >= 5) {
+    const parts = route.split('/');
+    mainContent = renderChapterComments(parts[2], parts[4]);
   } else if (route.startsWith('/book/')) {
     const id = route.split('/')[2];
     mainContent = renderBookPage(id);
@@ -838,7 +1814,7 @@ function render() {
 
   root.innerHTML = `
     <div class="app-layout">
-      ${hideNav ? '' : `<header class="top-header"><span class="app-logo">Flow World</span><div class="header-auth">${state.loggedIn ? `<span class="auth-user">${state.user.username}</span>${(state.notifications||[]).length ? `<span class="notif-badge">${state.notifications.length}</span>` : ''}<button class="btn btn-sm auth-btn" id="sign-out-btn">Sign out</button>` : `<button class="btn btn-sm auth-btn" onclick="navigate('#/signin')">Sign in</button><button class="btn btn-primary auth-btn" onclick="navigate('#/signup')">Sign up</button>`}</div></header>`}
+      ${hideNav ? '' : `<header class="top-header"><span class="app-logo">Flow World</span><div class="header-auth">${state.loggedIn ? `<span class="auth-user">${state.user.username}</span>${unreadTotal() ? `<span class="notif-badge" id="inbox-badge" style="cursor:pointer">${unreadTotal()}</span>` : ''}<button class="btn btn-sm auth-btn" id="sign-out-btn">Sign out</button>` : `<button class="btn btn-sm auth-btn" onclick="navigate('#/signin')">Sign in</button><button class="btn btn-primary auth-btn" onclick="navigate('#/signup')">Sign up</button>`}</div></header>`}
       <main class="main-content">${mainContent}</main>
       ${hideNav ? '' : `
       <nav class="bottom-nav">
@@ -854,6 +1830,7 @@ function render() {
   document.querySelectorAll('[data-nav]').forEach(el => {
     el.addEventListener('click', () => navigate('#' + el.dataset.nav));
   });
+  document.body.style.overflow = '';
 
   bindPageEvents(route);
   bindImageErrorLogging();
@@ -941,7 +1918,7 @@ function renderFeatured() {
 function bookCard(n) {
   const badge = n.status === 'Draft' ? '' : n.status === 'Completed' ? '<span class="badge badge-complete">DONE</span>' : '';
   return `<a class="book-card" href="#/book/${n.id}">
-    <div class="${coverClass('book-cover', n.cover)}" data-img-url="${n.cover || ''}" data-img-context="book-cover:${n.id}" style="${imageBg(n.cover, 'background:linear-gradient(135deg,' + coverColor(n.title) + ')')}">${badge}<span>${n.cover ? '' : imageFallback(n.title)}</span></div>
+    <div class="${coverClass('book-cover', n.cover)}" data-img-url="${n.cover || ''}" data-img-context="book-cover:${n.id}" style="${imageBg(n.cover, 'background:linear-gradient(135deg,' + coverColor(n.title) + ')')}">${badge}${n.cover ? '' : imageFallback(n.title)}</div>
     <div class="book-info"><div class="book-title">${n.title}</div><span class="book-author">${n.author}</span><div class="book-stats"><span>${fmt(n.flames)}</span></div></div>
   </a>`;
 }
@@ -1098,6 +2075,7 @@ function renderWorkspaceBook(id) {
   })();
   const publishedChs = chapters.filter(c => c.published);
   const draftChs = chapters.filter(c => !c.published);
+  const totalHls = chapters.reduce((sum, ch) => sum + getChapterHighlights(id, ch.id).length, 0);
   const avgViewsCh = chapters.length ? Math.round(totalViews / chapters.length) : 0;
   const estReadTime = chapters.reduce((sum, c) => sum + Math.ceil((c.content || '').length / 500), 0);
   const coverImg = book.cover || '';
@@ -1163,9 +2141,12 @@ function renderWorkspaceBook(id) {
             </div>
           </section>
         ` : wsTab === 'Chapters' ? `
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:6px">
             <h3 style="font-size:0.85rem;font-weight:600">Chapters (${chapters.length})</h3>
-            <button class="btn btn-sm" onclick="navigate('#/write/works/${id}/chapters/new')"><img src="Icons/editpen.png" width="12" style="vertical-align:middle;margin-right:4px">Add Chapter</button>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button class="btn btn-sm" onclick="navigate('#/write/works/${id}/highlights')" style="font-size:0.6rem;padding:4px 10px"><img src="Icons/inbox.png" width="11" style="vertical-align:middle;margin-right:4px">Highlights${totalHls ? ' (' + totalHls + ')' : ''}</button>
+              <button class="btn btn-sm" onclick="navigate('#/write/works/${id}/chapters/new')"><img src="Icons/editpen.png" width="12" style="vertical-align:middle;margin-right:4px">Add Chapter</button>
+            </div>
           </div>
           ${chapters.length ? `<div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap">
             <span style="font-size:0.6rem;color:var(--text3)">${publishedChs.length} Published</span>
@@ -1187,17 +2168,21 @@ function renderWorkspaceBook(id) {
             <h3 style="font-size:0.85rem;font-weight:600">Characters (${chars.length})</h3>
             <button class="btn btn-sm" onclick="navigate('#/write/works/${id}/characters/new')"><img src="Icons/person-plus.png" width="12" style="vertical-align:middle;margin-right:4px">Add Character</button>
           </div>
-          ${chars.length ? chars.map(c => `
-            <div class="char-item">
-              <div class="char-avatar">${c.name[0]}</div>
-              <div style="flex:1">
-                <h4 style="font-size:0.75rem;font-weight:600">${c.name}</h4>
-                <span style="font-size:0.6rem;color:var(--text2)">${c.role}</span>
-                <p style="font-size:0.65rem;color:var(--text3);margin-top:2px">${c.description}</p>
+          ${chars.length ? `<div class="ws-char-grid">${chars.map(c => `
+            <div class="ws-char-card">
+              <div class="${imageClass('ws-char-img', c.image || c.portrait)}" data-img-url="${c.image || c.portrait || ''}" data-img-context="workspace-character:${c.id}" style="${c.image || c.portrait ? imageBg(c.image || c.portrait, '') : 'background:var(--bg-hover)'}">${(c.image || c.portrait) ? '' : imageFallback(c.name)}</div>
+              <div class="ws-char-body">
+                <h4 class="ws-char-name">${c.name}</h4>
+                ${c.nickname ? `<span class="ws-char-sub">"${escHtml(c.nickname)}"</span>` : `<span class="ws-char-sub">${escHtml(c.role || 'Character')}</span>`}
+                ${c.description ? `<p class="ws-char-desc">${escHtml(c.description.length > 80 ? c.description.slice(0, 80) + '...' : c.description)}</p>` : ''}
+                <div class="ws-char-actions">
+                  <a class="btn btn-sm" href="#/book/${id}/character/${c.id}" style="text-decoration:none;font-size:0.55rem;padding:3px 8px;background:rgba(255,255,255,0.08);color:var(--text2)"><img src="Icons/view.png" width="10" style="vertical-align:middle;margin-right:3px">View</a>
+                  <a class="btn btn-sm" href="#/write/works/${id}/characters/${c.id}" style="text-decoration:none;font-size:0.55rem;padding:3px 8px;background:var(--accent-subtle);color:var(--accent)"><img src="Icons/editpen.png" width="10" style="vertical-align:middle;margin-right:3px">Edit</a>
+                  <button class="btn btn-sm ws-del-char" data-book="${id}" data-char="${c.id}" style="font-size:0.55rem;padding:3px 8px;color:var(--red)">Delete</button>
+                </div>
               </div>
-              <button class="btn btn-sm ws-del-char" data-book="${id}" data-char="${c.id}" style="font-size:0.55rem;padding:3px 8px;color:var(--red)">Delete</button>
             </div>
-          `).join('') : '<p style="font-size:0.72rem;color:var(--text3);padding:16px 0;text-align:center">No characters yet.</p>'}
+          `).join('')}</div>` : '<p style="font-size:0.72rem;color:var(--text3);padding:16px 0;text-align:center">No characters yet. Add your first character.</p>'}
         ` : wsTab === 'Analytics' ? `
           <section class="content-section">
             <h3 class="section-title">Views</h3>
@@ -1348,7 +2333,12 @@ function renderCreateChapter(bookId) {
         </div>
         <div class="form-group">
           <label>Content</label>
-          <textarea class="input-field" name="content" placeholder="Write your chapter..." rows="12" style="min-height:200px"></textarea>
+          <div class="editor-toolbar">
+            <button type="button" class="ed-fmt ed-fmt-bold" data-fmt="**" title="Bold"><strong>B</strong></button>
+            <button type="button" class="ed-fmt ed-fmt-italic" data-fmt="*" title="Italic"><em>I</em></button>
+            <span class="editor-toolbar-hint">Format: <strong>**bold**</strong> or <em>*italic*</em></span>
+          </div>
+          <textarea class="input-field" name="content" placeholder="Write your chapter... (paste image links and they will display full-size)" rows="12" style="min-height:200px"></textarea>
         </div>
         <div style="display:flex;gap:8px">
           <button type="submit" class="btn btn-primary" style="flex:1"><img src="Icons/settings.png" width="12" style="vertical-align:middle;margin-right:4px">Save Draft</button>
@@ -1358,36 +2348,236 @@ function renderCreateChapter(bookId) {
     </div>`;
 }
 
+// ---- Characters: shared form + image cropper ----
+function characterFormFields(c) {
+  c = c || {};
+  const img = c.image || c.portrait || '';
+  return `
+    <div class="form-group">
+      <label>Portrait Image</label>
+      <div class="img-upload-wrap">
+        <input type="file" accept="image/*" id="char-portrait-input" style="display:none">
+        <div id="char-portrait-preview" class="img-preview" data-image="${escHtml(img)}" ${img ? `style="${imageBg(img, '')}"` : ''}>${img ? '' : '+'}</div>
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <button type="button" class="btn btn-sm char-upload-btn" style="width:max-content"><img src="Icons/editpen.png" width="12" style="vertical-align:middle;margin-right:4px">Upload &amp; Crop</button>
+          ${img ? '<button type="button" class="btn btn-sm char-remove-img" style="width:max-content;color:var(--red)">Remove Image</button>' : ''}
+        </div>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Name</label>
+        <input class="input-field" name="name" value="${escHtml(c.name || '')}" placeholder="Character name" required>
+      </div>
+      <div class="form-group">
+        <label>Nickname</label>
+        <input class="input-field" name="nickname" value="${escHtml(c.nickname || '')}" placeholder="Nickname / alias">
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Age</label>
+        <input class="input-field" name="age" value="${escHtml(c.age || '')}" placeholder="e.g. 17">
+      </div>
+      <div class="form-group">
+        <label>Height</label>
+        <input class="input-field" name="height" value="${escHtml(c.height || '')}" placeholder="e.g. 170 cm">
+      </div>
+      <div class="form-group">
+        <label>Weight</label>
+        <input class="input-field" name="weight" value="${escHtml(c.weight || '')}" placeholder="e.g. 60 kg">
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Role</label>
+      <input class="input-field" name="role" value="${escHtml(c.role || '')}" placeholder="Protagonist, Antagonist, etc.">
+    </div>
+    <div class="form-group">
+      <label>Description</label>
+      <textarea class="input-field" name="description" placeholder="Describe your character..." rows="5">${escHtml(c.description || '')}</textarea>
+    </div>`;
+}
+
+function cropModalHtml() {
+  return `
+    <div class="crop-modal" id="crop-modal" style="display:none">
+      <div class="crop-overlay" id="crop-overlay"></div>
+      <div class="crop-panel">
+        <div class="crop-panel-header">
+          <span class="crop-title">Crop Character Image</span>
+          <span class="crop-hint">Drag to move &middot; handles to resize</span>
+        </div>
+        <div class="crop-stage" id="crop-stage">
+          <img id="crop-img" alt="crop">
+          <div class="crop-box" id="crop-box">
+            <span class="crop-handle ch-nw"></span><span class="crop-handle ch-n"></span><span class="crop-handle ch-ne"></span>
+            <span class="crop-handle ch-w"></span><span class="crop-handle ch-e"></span>
+            <span class="crop-handle ch-sw"></span><span class="crop-handle ch-s"></span><span class="crop-handle ch-se"></span>
+          </div>
+        </div>
+        <div class="crop-actions">
+          <button type="button" class="btn btn-sm" id="crop-reset">Reset</button>
+          <button type="button" class="btn btn-sm" id="crop-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="crop-apply">Apply Crop</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// Crop engine state
+let cropCtx = null;
+
+function charCropOpen(file, onApply) {
+  const modal = document.getElementById('crop-modal');
+  const stage = document.getElementById('crop-stage');
+  const disp = document.getElementById('crop-img');
+  const box = document.getElementById('crop-box');
+  if (!modal || !stage || !disp || !box) return;
+  const src = file instanceof File ? URL.createObjectURL(file) : file;
+  const srcObj = file instanceof File;
+  const srcImg = new Image();
+  cropCtx = { onApply, srcImg, srcObj, ready: false };
+  srcImg.onload = () => {
+    cropCtx.ready = true;
+    const sr = stage.getBoundingClientRect();
+    const scale = Math.min(sr.width / srcImg.naturalWidth, sr.height / srcImg.naturalHeight);
+    const dw = srcImg.naturalWidth * scale, dh = srcImg.naturalHeight * scale;
+    cropCtx.imgRect = { left: (sr.width - dw) / 2, top: (sr.height - dh) / 2, width: dw, height: dh, scale, nw: srcImg.naturalWidth, nh: srcImg.naturalHeight };
+    cropResetBox();
+  };
+  disp.src = src;
+  srcImg.src = src;
+  modal.style.display = 'flex';
+}
+
+function cropResetBox() {
+  const box = document.getElementById('crop-box');
+  if (!box || !cropCtx || !cropCtx.ready) return;
+  const ir = cropCtx.imgRect;
+  let w = ir.width * 0.72;
+  let h = w * 1.25;
+  if (h > ir.height) { h = ir.height * 0.9; w = h / 1.25; }
+  const left = ir.left + (ir.width - w) / 2;
+  const top = ir.top + (ir.height - h) / 2;
+  box.style.left = left + 'px'; box.style.top = top + 'px';
+  box.style.width = w + 'px'; box.style.height = h + 'px';
+}
+
+function cropClose(apply) {
+  if (cropCtx && cropCtx.srcObj) URL.revokeObjectURL(cropCtx.srcImg.src);
+  cropCtx = null;
+  const modal = document.getElementById('crop-modal');
+  if (modal) modal.style.display = 'none';
+  if (!apply) return;
+}
+
+function charCropApply() {
+  if (!cropCtx || !cropCtx.ready) return;
+  const ir = cropCtx.imgRect;
+  const box = document.getElementById('crop-box');
+  const br = box.getBoundingClientRect();
+  const sx = Math.max(0, (br.left - ir.left) / ir.scale);
+  const sy = Math.max(0, (br.top - ir.top) / ir.scale);
+  const sw = Math.min(ir.nw - sx, br.width / ir.scale);
+  const sh = Math.min(ir.nh - sy, br.height / ir.scale);
+  const cv = document.createElement('canvas');
+  cv.width = Math.max(1, Math.round(sw));
+  cv.height = Math.max(1, Math.round(sh));
+  const ctx = cv.getContext('2d');
+  ctx.drawImage(cropCtx.srcImg, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
+  const dataUrl = cv.toDataURL('image/jpeg', 0.9);
+  const onApply = cropCtx.onApply;
+  cropClose(true);
+  if (onApply) onApply(dataUrl);
+}
+
+function bindCharCropper() {
+  const modal = document.getElementById('crop-modal');
+  if (!modal) return;
+  const stage = document.getElementById('crop-stage');
+  const box = document.getElementById('crop-box');
+  document.getElementById('crop-overlay').addEventListener('click', () => cropClose(false));
+  document.getElementById('crop-cancel').addEventListener('click', () => cropClose(false));
+  document.getElementById('crop-reset').addEventListener('click', cropResetBox);
+  document.getElementById('crop-apply').addEventListener('click', charCropApply);
+
+  if (stage && box) {
+    const drag = { mode: null };
+    box.addEventListener('pointerdown', e => {
+      if (!cropCtx || !cropCtx.ready) return;
+      e.preventDefault();
+      const br = box.getBoundingClientRect();
+      const mres = (e.target.className.match(/ch-(\w+)/) || [])[1];
+      drag.mode = mres || 'move';
+      drag.sx = e.clientX; drag.sy = e.clientY;
+      drag.ox = br.left; drag.oy = br.top; drag.ow = br.width; drag.oh = br.height;
+      box.setPointerCapture(e.pointerId);
+    });
+    box.addEventListener('pointermove', e => {
+      if (!cropCtx || !drag.mode) { drag.mode = null; return; }
+      if (!cropCtx.ready) return;
+      const ir = cropCtx.imgRect;
+      const dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+      let L = drag.ox, T = drag.oy, R = drag.ox + drag.ow, B = drag.oy + drag.oh;
+      const mn = 48;
+      if (drag.mode === 'move') {
+        L += dx; T += dy;
+        R = L + drag.ow; B = T + drag.oh;
+      } else {
+        if (drag.mode.indexOf('w') > -1) L += dx;
+        if (drag.mode.indexOf('e') > -1) R += dx;
+        if (drag.mode.indexOf('n') > -1) T += dy;
+        if (drag.mode.indexOf('s') > -1) B += dy;
+      }
+      if (R - L < mn) { R = drag.mode.indexOf('e') > -1 ? L + mn : L; }
+      if (B - T < mn) { B = drag.mode.indexOf('s') > -1 ? T + mn : T; }
+      L = Math.max(ir.left, Math.min(L, ir.left + ir.width - mn));
+      T = Math.max(ir.top, Math.min(T, ir.top + ir.height - mn));
+      R = Math.max(L + mn, Math.min(R, ir.left + ir.width));
+      B = Math.max(T + mn, Math.min(B, ir.top + ir.height));
+      box.style.left = L + 'px'; box.style.top = T + 'px';
+      box.style.width = (R - L) + 'px'; box.style.height = (B - T) + 'px';
+    });
+    const endDrag = () => { drag.mode = null; };
+    box.addEventListener('pointerup', endDrag);
+    box.addEventListener('pointercancel', endDrag);
+  }
+}
+
 // ---- Create Character ----
 function renderCreateCharacter(bookId) {
   const book = getBook(bookId);
   if (!book) return '<div class="page"><h2>Book not found</h2></div>';
   return `
     <div class="page">
-      <a class="back-link" href="#/write/works/${bookId}">Back to ${book.title}</a>
+      <a class="back-link" href="#/write/works/${bookId}"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back to ${escHtml(book.title)}</a>
       <h1 class="page-title">New Character</h1>
-      <form id="create-character-form" data-book="${bookId}" style="display:flex;flex-direction:column;gap:14px">
-        <div class="form-group">
-          <label>Portrait Image</label>
-          <div class="img-upload-wrap">
-            <input type="file" accept="image/*" id="char-portrait-input" style="display:none">
-            <div id="char-portrait-preview" class="img-preview" style="width:80px;height:80px;border-radius:50%">+</div>
-          </div>
-        </div>
-        <div class="form-group">
-          <label>Character Name</label>
-          <input class="input-field" name="name" placeholder="Character name" required>
-        </div>
-        <div class="form-group">
-          <label>Role</label>
-          <input class="input-field" name="role" placeholder="Protagonist, Antagonist, etc.">
-        </div>
-        <div class="form-group">
-          <label>Description</label>
-          <textarea class="input-field" name="description" placeholder="Describe your character..." rows="4"></textarea>
-        </div>
+      <form id="create-character-form" data-book="${bookId}" class="char-form-card" style="display:flex;flex-direction:column;gap:14px">
+        ${characterFormFields()}
         <button type="submit" class="btn btn-primary"><img src="Icons/person-plus.png" width="12" style="vertical-align:middle;margin-right:4px">Add Character</button>
       </form>
+      ${cropModalHtml()}
+    </div>`;
+}
+
+// ---- Edit Character (author's own space) ----
+function renderEditCharacter(bookId, charId) {
+  const book = getBook(bookId);
+  const c = (state.characters[bookId] || []).find(x => x.id === charId);
+  if (!book || !c) return '<div class="page"><h2>Character not found</h2></div>';
+  return `
+    <div class="page">
+      <a class="back-link" href="#/write/works/${bookId}"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back to ${escHtml(book.title)}</a>
+      <h1 class="page-title">Edit Character</h1>
+      <p style="font-size:0.62rem;color:var(--text3);margin:-8px 0 12px"><a href="#/book/${bookId}/character/${charId}" style="color:var(--accent)">View public character page</a></p>
+      <form id="edit-character-form" data-book="${bookId}" data-char="${charId}" class="char-form-card" style="display:flex;flex-direction:column;gap:14px">
+        ${characterFormFields(c)}
+        <div style="display:flex;gap:8px">
+          <button type="submit" class="btn btn-primary" style="flex:1"><img src="Icons/settings.png" width="12" style="vertical-align:middle;margin-right:4px">Save Changes</button>
+          <button type="button" class="btn btn-sm ws-del-char" data-book="${bookId}" data-char="${charId}" style="color:var(--red)">Delete Character</button>
+        </div>
+      </form>
+      ${cropModalHtml()}
     </div>`;
 }
 
@@ -1409,7 +2599,12 @@ function renderEditor(bookId, chapterId) {
       </div>
       <div style="flex:1;display:flex;flex-direction:column;padding:16px 20px;overflow-y:auto">
         <input id="editor-title" class="input-field" style="font-size:1rem;font-weight:700;border:none;padding:4px 0;margin-bottom:12px;background:transparent" value="${chapter.title}" placeholder="Chapter Title">
-        <textarea id="editor-content" style="flex:1;width:100%;background:transparent;border:none;resize:none;font-size:0.85rem;line-height:1.7;padding:4px 0;color:var(--text)" placeholder="Start writing...">${chapter.content}</textarea>
+        <div class="editor-toolbar">
+          <button type="button" class="ed-fmt ed-fmt-bold" data-fmt="**" title="Bold"><strong>B</strong></button>
+          <button type="button" class="ed-fmt ed-fmt-italic" data-fmt="*" title="Italic"><em>I</em></button>
+          <span class="editor-toolbar-hint">Format: <strong>**bold**</strong> or <em>*italic*</em></span>
+        </div>
+        <textarea id="editor-content" style="flex:1;width:100%;background:transparent;border:none;resize:none;font-size:0.9rem;line-height:1.8;padding:4px 0;color:var(--text)" placeholder="Start writing...">${chapter.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</textarea>
       </div>
     </div>
 
@@ -1489,16 +2684,9 @@ function renderProfile() {
   const expPct = Math.min(100, Math.round((exp / expToNext) * 100));
 
   // Achievements
-  const achievements = [];
-  if (myBooks.length >= 1) achievements.push({ icon: 'Icons/book.png', label: 'First Book' });
-  if (myBooks.length >= 3) achievements.push({ icon: 'Icons/books-stack-of-three.png', label: '3 Books' });
-  if (myBooks.length >= 5) achievements.push({ icon: 'Icons/books-stack-of-three.png', label: '5 Books' });
-  if (totalViews >= 100) achievements.push({ icon: 'Icons/view.png', label: '100 Views' });
-  if (totalViews >= 1000) achievements.push({ icon: 'Icons/view.png', label: '1K Views' });
-  if (totalViews >= 100000) achievements.push({ icon: 'Icons/view.png', label: '100K Views' });
-  if (totalFlames >= 1) achievements.push({ icon: 'Icons/fire.png', label: 'First Flame' });
-  if (totalFlames >= 100) achievements.push({ icon: 'Icons/fire-flame.png', label: '100 Flames' });
-  if (compBooks >= 1) achievements.push({ icon: 'Icons/icons8-check-mark-50.png', label: 'Completed Work' });
+  const achInfo = computeAchievements();
+  const achievements = achInfo.achievements;
+  const lockedAch = achInfo.locked.length;
 
   // Recently Read - last 3 books with progress
   const recentlyRead = myBooks.filter(b => b.lastReadAt).sort((a, b) => (b.lastReadAt || 0) - (a.lastReadAt || 0)).slice(0, 3);
@@ -1571,9 +2759,9 @@ function renderProfile() {
           <div class="prof-action-icon"><img src="Icons/user1.png" width="22"></div>
           <span class="prof-action-label">Edit Profile</span>
         </div>
-        <div class="prof-action" id="prof-inbox-toggle" style="cursor:pointer">
+        <div class="prof-action" onclick="navigate('#/inbox')">
           <div class="prof-action-icon"><img src="Icons/inbox.png" width="22"></div>
-          <span class="prof-action-label">Inbox${(state.notifications||[]).length ? ' (' + state.notifications.length + ')' : ''}</span>
+          <span class="prof-action-label">Inbox${unreadTotal() ? ' (' + unreadTotal() + ')' : ''}</span>
         </div>
         <div class="prof-action" onclick="navigate('#/profile/author')">
           <div class="prof-action-icon"><img src="Icons/user.png" width="22"></div>
@@ -1583,15 +2771,6 @@ function renderProfile() {
           <div class="prof-action-icon"><img src="Icons/open-book.png" width="22"></div>
           <span class="prof-action-label">New Book</span>
         </div>
-      </div>
-
-      <!-- Inbox -->
-      <div class="prof-inbox prof-inbox" id="prof-inbox" style="display:none">
-        ${(state.notifications||[]).length ? state.notifications.map(n => `
-        <div class="prof-inbox-item">
-          <span class="prof-inbox-text">${n.text}</span>
-          <span class="prof-inbox-date">${n.date}</span>
-        </div>`).join('') : '<div class="prof-inbox-empty">No notifications yet</div>'}
       </div>
 
       <!-- Recently Read -->
@@ -1610,7 +2789,7 @@ function renderProfile() {
       <!-- Achievements -->
       ${achievements.length ? `
       <div class="content-section">
-        <div class="section-header"><h3 class="section-title">Achievements</h3></div>
+        <div class="section-header"><h3 class="section-title">Achievements</h3>${lockedAch ? `<span class="prof-ach-locked-note">+${lockedAch} locked</span>` : ''}</div>
         <div class="prof-achievements prof-achievements">
           ${achievements.map(a => `
           <div class="prof-achievement">
@@ -1723,6 +2902,7 @@ function renderEditProfile() {
 
 // ---- Author Profile (Creator Hub - Public) ----
 let authorTab = 'Overview';
+let inboxTab = 'Notifications';
 const ACHIEVEMENT_THRESHOLDS = [100000, 500000, 1000000];
 const FLAME_MILESTONES = [1000, 5000, 10000, 50000, 100000];
 
@@ -1782,7 +2962,9 @@ function renderAuthorProfile() {
       ${u.bio ? `<p class="author-bio">${u.bio}</p>` : ''}
 
       <div class="author-actions">
-        <button class="btn btn-primary author-follow-btn">+ Follow</button>
+        ${(state.following || []).includes(u.username) ?
+          `<button class="btn btn-sm" disabled style="opacity:0.6;cursor:default">Following</button>` :
+          `<button class="btn btn-primary author-follow-btn" data-author="${u.username}">+ Follow</button>`}
         <button class="btn btn-sm author-support-btn">Support</button>
       </div>
 
@@ -1969,6 +3151,87 @@ function renderThemes() {
     </div>`;
 }
 
+// ---- Inbox ----
+function renderInbox() {
+  if (!state.loggedIn) return renderSignIn();
+  const u = state.user;
+  const notifs = state.notifications || [];
+  const messages = (state.messages || []).filter(m => m.to === u.username).sort((a,b) => new Date(b.date) - new Date(a.date));
+  const unreadMsgs = messages.filter(m => !m.read).length;
+  const achInfo = computeAchievements();
+  const notifTabs = ['Notifications','Messages','Achievements'];
+
+  return `
+    <div class="page inbox-page">
+      <a class="back-link" href="#/profile"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back to Profile</a>
+      <h1 class="page-title" style="display:flex;align-items:center;gap:8px"><img src="Icons/inbox.png" width="20">Inbox</h1>
+
+      <div class="inbox-tabs">
+        ${notifTabs.map(t => `<span class="tab${inboxTab===t?' active':''}" data-inbox-tab="${t}">${t}${t==='Messages' && unreadMsgs ? ` (${unreadMsgs})` : ''}${t==='Notifications' && notifs.length ? '' : ''}</span>`).join('')}
+      </div>
+
+      <div class="inbox-content">
+        ${inboxTab === 'Notifications' ? `
+          <div class="inbox-actions-row">
+            <button class="btn btn-sm" id="inbox-refresh" style="font-size:0.6rem;background:var(--bg-hover);color:var(--text2)">Refresh</button>
+            <button class="btn btn-sm" id="inbox-mark-notifs-read" style="font-size:0.6rem;background:var(--bg-hover);color:var(--text2)">Mark all read</button>
+          </div>
+          ${notifs.length ? notifs.map(n => `
+          <div class="inbox-item${n.read ? ' read' : ''}">
+            <span class="inbox-item-dot${n.read ? '' : ' unread'}" title="Unread"></span>
+            <div class="inbox-item-body">
+              <span class="inbox-item-type">${n.type || 'info'}</span>
+              <p class="inbox-item-text">${escHtml(n.message || n.text || '')}</p>
+              <span class="inbox-item-date">${n.created_at ? new Date(n.created_at).toLocaleString() : (n.date || '')}</span>
+            </div>
+          </div>`).join('') : '<div class="inbox-empty">No notifications yet</div>'}
+        ` : inboxTab === 'Messages' ? `
+          <div class="inbox-actions-row">
+            <button class="btn btn-sm" id="inbox-mark-msgs-read" style="font-size:0.6rem;background:var(--bg-hover);color:var(--text2)">Mark all read</button>
+          </div>
+          ${messages.length ? messages.map(m => `
+          <div class="inbox-item${m.read ? ' read' : ''}">
+            <span class="inbox-item-dot${m.read ? '' : ' unread'}" title="Unread"></span>
+            <div class="inbox-item-body">
+              <span class="inbox-item-author"><strong>${escHtml(m.from)}</strong> replied to your comment or review</span>
+              ${m.target ? `<a class="inbox-item-link" href="${m.link || '#/inbox'}">${escHtml(m.target)}</a>` : ''}
+              <p class="inbox-item-quote">${escHtml(m.quote || '')}</p>
+              <p class="inbox-item-text">${escHtml(m.text || '')}</p>
+              <span class="inbox-item-date">${new Date(m.date || Date.now()).toLocaleString()}</span>
+            </div>
+          </div>`).join('') : '<div class="inbox-empty">No messages yet. Comments you get replies on will appear here.</div>'}
+        ` : `
+          <div class="inbox-achievements">
+            <div class="inbox-ach-stats">${achInfo.achievements.length} unlocked &middot; ${achInfo.locked.length} locked &middot; track your next goal below</div>
+            ${ACHIEVEMENT_GROUPS.map(g => {
+              const groupDefs = achInfo.all.filter(a => a.group === g);
+              if (!groupDefs.length) return '';
+              return `
+              <div class="ach-group">
+                <div class="ach-group-title">${g}</div>
+                <div class="ach-group-grid">
+                  ${groupDefs.map(a => a.achieved ? `
+                  <div class="ach-glass-card ach-unlocked" title="${escHtml(a.label)} \u00b7 ${escHtml(a.desc)}">
+                    <div class="ach-glass-icon"><img src="${a.icon}" alt="${escHtml(a.label)}"></div>
+                    <div class="ach-glass-label">${escHtml(a.label)}</div>
+                    <div class="ach-glass-desc">${escHtml(a.desc)}</div>
+                    <div class="ach-glass-date"><img src="Icons/icons8-check-mark-50.png" width="10" style="vertical-align:middle;margin-right:4px">${a.date ? 'Achieved ' + new Date(a.date).toLocaleDateString() : 'Achieved Today'}</div>
+                  </div>` : `
+                  <div class="ach-glass-card ach-locked" title="${escHtml(a.label)} \u00b7 ${escHtml(a.desc)}">
+                    <div class="ach-glass-icon"><img src="${a.icon}" alt="Locked">${a.mystery && !a.achieved ? '<span class="ach-question">?</span>' : ''}</div>
+                    <div class="ach-glass-label">${escHtml(a.label)}</div>
+                    <div class="ach-glass-desc">${escHtml(a.desc)}</div>
+                    <div class="ach-glass-lock">Locked</div>
+                  </div>`).join('')}
+                </div>
+              </div>`;
+            }).join('')}
+          </div>
+        `}
+      </div>
+    </div>`;
+}
+
 // ---- Sign In ----
 function renderSignIn() {
   if (state.loggedIn) return renderProfile();
@@ -2041,13 +3304,189 @@ function renderSignUp() {
 
 // ---- Book Page ----
 let bookTab = 'Overview';
+
+// ---- Review rating categories ----
+const REVIEW_CATEGORIES = [
+  { key: 'story', label: 'Story', desc: 'Plot, premise, and overall storytelling' },
+  { key: 'characters', label: 'Characters', desc: 'Character development, personality, and relationships' },
+  { key: 'writing', label: 'Writing', desc: 'Prose, grammar, descriptions, and readability' },
+  { key: 'pacing', label: 'Pacing', desc: 'How well the story progresses and how engaging the chapters are' },
+  { key: 'enjoyment', label: 'Enjoyment', desc: "The reader's overall enjoyment of the book" },
+];
+
+function parseRatings(raw) {
+  if (raw && typeof raw === 'object') return raw;
+  if (typeof raw === 'string') { try { return JSON.parse(raw); } catch (e) {} }
+  return {};
+}
+
+function clampStar(v) {
+  const n = parseInt(v, 10);
+  return (n >= 1 && n <= 5) ? n : 5;
+}
+
+function ratingOverall(ratings) {
+  const vals = REVIEW_CATEGORIES.map(c => +ratings[c.key]).filter(v => v >= 1 && v <= 5);
+  if (!vals.length) return 5;
+  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+  return Math.round(avg * 10) / 10;
+}
+
+function starsIcon(n) {
+  const val = Math.max(0, Math.min(5, Math.round(n || 0)));
+  let out = '';
+  for (let i = 1; i <= 5; i++) out += `<span class="star-ic${i <= val ? ' on' : ''}">${i <= val ? '&#9733;' : '&#9734;'}</span>`;
+  return `<span class="review-rate-stars">${out}</span>`;
+}
+
+function avgRating(reviews) {
+  const rs = (reviews || []).map(r => +r.rating).filter(v => v >= 1 && v <= 5);
+  return rs.length ? (rs.reduce((a, b) => a + b, 0) / rs.length).toFixed(1) : null;
+}
+
+function reviewRatingFormHtml() {
+  return `
+    <div class="review-rating-grid">
+      ${REVIEW_CATEGORIES.map(c => `
+      <div class="rev-rate-row" data-cat="${c.key}">
+        <span class="rev-rate-lbl">${c.label}<small>${c.desc}</small></span>
+        <span class="rev-stars">
+          ${[1, 2, 3, 4, 5].map(v => `<button type="button" class="star${v === 5 ? ' on' : ''}" data-cat="${c.key}" data-val="${v}" title="${v} star${v > 1 ? 's' : ''}">&#9733;</button>`).join('')}
+        </span>
+      </div>`).join('')}
+    </div>
+    <div class="rev-overall-row">Overall Rating: <span class="rev-overall-val">5.0</span> / 5</div>
+  `;
+}
+
+function recomputeReviewOverall(form) {
+  const vals = [];
+  form.querySelectorAll('.rev-rate-row').forEach(row => {
+    const on = row.querySelector('.star.on');
+    if (on) vals.push(+on.dataset.val);
+  });
+  const ov = vals.length ? (vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+  const el = form.querySelector('.rev-overall-val');
+  if (el) el.textContent = ov.toFixed(1);
+}
+
+function reviewRatingsBlockHtml(r) {
+  const rt = parseRatings(r.ratings);
+  const hasCats = REVIEW_CATEGORIES.some(c => +rt[c.key] >= 1 && +rt[c.key] <= 5);
+  const overall = hasCats ? ratingOverall(rt) : (+r.rating >= 1 && +r.rating <= 5 ? +r.rating : 5);
+  return `
+    <div class="review-rating-block">
+      ${hasCats ? REVIEW_CATEGORIES.map(c => `
+        <div class="review-rate-row">
+          <span class="rrl">${c.label}</span>
+          ${starsIcon(+rt[c.key])}
+          <span class="rrv">${+rt[c.key]}/5</span>
+        </div>`).join('') : ''}
+      <div class="review-overall-line">
+        <span class="rol-lbl">Overall</span>
+        <span class="rol-val">${overall.toFixed(1)}</span>
+        ${starsIcon(overall)}
+      </div>
+    </div>`;
+}
+
+function reviewItemHtml(r, id, isAuthor) {
+  const replies = (r.replies || []).map(rp => `
+    <div class="review-reply">
+      <strong class="review-reply-author">${escHtml(rp.username)}</strong>
+      <span style="font-size:0.52rem;color:var(--text3);margin-left:6px">${rp.createdAt || ''}</span>
+      <p class="review-reply-text">${escHtml(rp.content)}</p>
+    </div>`).join('');
+  return `
+    <div class="review-item${r.pinned ? ' pinned' : ''}">
+      ${r.pinned ? '<div class="review-pinned-badge">Pinned Review</div>' : ''}
+      <div class="review-header">
+        <span class="review-avatar">${escHtml(String(r.username || '?')[0])}</span>
+        <span class="review-author">${escHtml(r.username)}</span>
+        <span class="review-date">${r.editedAt ? r.editedAt + ' (edited)' : r.createdAt}</span>
+      </div>
+      ${reviewRatingsBlockHtml(r)}
+      <p class="review-text">${escHtml(r.content)}</p>
+      ${r.favorited ? '<div class="review-fav-badge">Author\'s Favorite</div>' : ''}
+      ${replies ? `<div class="review-replies">${replies}</div>` : ''}
+      <div class="review-actions">
+        ${isAuthor ? `
+          <button class="btn btn-sm review-pin-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px">${r.pinned ? 'Unpin' : 'Pin'}</button>
+          <button class="btn btn-sm review-fav-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px">${r.favorited ? 'Unfavorite' : 'Favorite'}</button>
+          <button class="btn btn-sm review-del-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px;color:var(--red)">Delete</button>
+        ` : state.loggedIn && r.username === state.user.username ? `
+          <button class="btn btn-sm review-del-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px;color:var(--red)">Delete</button>
+        ` : ''}
+        ${state.loggedIn ? `<button class="btn btn-sm review-reply-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px;color:var(--accent)">Reply</button>` : ''}
+        ${state.loggedIn ? `<button class="btn btn-sm review-like-btn${(r.likes || []).includes(state.user.username) ? ' on' : ''}" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px">${(r.likes || []).length ? 'Like ' + r.likes.length : 'Like'}</button>` : ''}
+      </div>
+      ${state.loggedIn ? `
+      <form class="review-reply-form" data-book="${id}" data-review="${r.id}" style="display:none;margin-top:8px">
+        <div style="display:flex;gap:6px">
+          <input class="input-field" name="content" placeholder="Reply to review..." style="flex:1;font-size:0.65rem">
+          <button type="submit" class="btn btn-sm" style="font-size:0.55rem;padding:3px 10px">Post</button>
+        </div>
+      </form>` : ''}
+    </div>`;
+}
+
+function chCommentHtml(c, bookId, chapterId, bookAuthor) {
+  if (!c || c.para !== undefined) return '';
+  const replies = (c.replies || []).map(rp => `
+    <div class="review-reply">
+      <strong class="review-reply-author">${escHtml(rp.username)}</strong>
+      <span style="font-size:0.52rem;color:var(--text3);margin-left:6px">${rp.createdAt || ''}</span>
+      <p class="review-reply-text">${escHtml(rp.content)}</p>
+    </div>`).join('');
+  const canMod = state.loggedIn && (c.username === state.user.username || bookAuthor === state.user.username);
+  const liked = state.loggedIn && (c.likes || []).includes(state.user.username);
+  return `
+    <div class="ch-comment-item">
+      <span class="ch-comment-avatar">${escHtml(String(c.username || '?')[0])}</span>
+      <div class="ch-comment-body">
+        <span class="ch-comment-author">${escHtml(c.username)}</span>
+        <span class="ch-comment-date">${c.createdAt}</span>
+        <p class="ch-comment-text">${escHtml(c.content)}</p>
+        ${replies ? `<div class="review-replies">${replies}</div>` : ''}
+        <div class="ch-comment-actions">
+          ${state.loggedIn ? `
+          <button class="btn btn-sm ch-comment-like${liked ? ' on' : ''}" data-book="${bookId}" data-chapter="${chapterId}" data-comment="${c.id}" style="font-size:0.5rem;padding:2px 8px">${(c.likes || []).length ? 'Like ' + c.likes.length : 'Like'}</button>
+          <button class="btn btn-sm ch-comment-reply-btn" data-book="${bookId}" data-chapter="${chapterId}" data-comment="${c.id}" style="font-size:0.5rem;padding:2px 8px;color:var(--accent)">Reply</button>` : ''}
+          ${canMod ? `<button class="btn btn-sm ch-comment-del" data-book="${bookId}" data-chapter="${chapterId}" data-comment="${c.id}" style="font-size:0.5rem;padding:2px 6px;color:var(--red);flex-shrink:0">Delete</button>` : ''}
+        </div>
+        ${state.loggedIn ? `
+        <form class="ch-comment-reply-form" data-book="${bookId}" data-chapter="${chapterId}" data-comment="${c.id}" style="display:none;gap:6px;margin-top:6px">
+          <input class="input-field" name="content" placeholder="Reply..." style="flex:1;font-size:0.6rem">
+          <button type="submit" class="btn btn-sm" style="font-size:0.5rem;padding:2px 8px">Reply</button>
+        </form>` : ''}
+      </div>
+    </div>`;
+}
+
+function paraCommentRowHtml(c, bookId, chapterId, bookAuthor) {
+  const canMod = state.loggedIn && (c.username === state.user.username || bookAuthor === state.user.username);
+  const liked = state.loggedIn && (c.likes || []).includes(state.user.username);
+  return `
+    <div class="ch-comment-item">
+      <span class="ch-comment-avatar">${escHtml(String(c.username || '?')[0])}</span>
+      <div class="ch-comment-body">
+        <span class="ch-comment-author">${escHtml(c.username)}</span>
+        <span class="ch-comment-date">${c.createdAt}</span>
+        <p class="ch-comment-text">${escHtml(c.content)}</p>
+        ${state.loggedIn ? `<div class="ch-comment-actions">
+          <button class="btn btn-sm para-like${liked ? ' on' : ''}" data-book="${bookId}" data-chapter="${chapterId}" data-comment="${c.id}" style="font-size:0.5rem;padding:2px 8px">${(c.likes || []).length ? 'Like ' + c.likes.length : 'Like'}</button>
+        </div>` : ''}
+      </div>
+      ${canMod ? `<button class="btn btn-sm para-comment-del" data-book="${bookId}" data-chapter="${chapterId}" data-comment="${c.id}" style="font-size:0.5rem;padding:2px 6px;color:var(--red);flex-shrink:0">Delete</button>` : ''}
+    </div>`;
+}
+
 function renderBookPage(id) {
   const book = getBook(id);
   if (!book) return '<div class="page"><h2>Book not found</h2></div>';
   const isAuthor = state.loggedIn && book.author === state.user.username;
   if (!isAuthor && !isPublicBook(book)) return '<div class="page"><h2>Book not found</h2></div>';
 
-  recordView(id);
   const chapters = (state.chapters[id] || []).filter(c => c.published);
   const chars = state.characters[id] || [];
   const isFav = state.favorites.includes(id);
@@ -2081,15 +3520,18 @@ function renderBookPage(id) {
             <div class="bid-stat"><span class="bid-val">${fmt(book.flames)}</span><span class="bid-lbl">Flames</span></div>
           </div>
           <div class="book-identity-actions">
+            <a class="btn btn-primary" href="#/book/${id}/read/${chapters[0] ? chapters[0].id : ''}" style="text-decoration:none;${!chapters.length ? 'opacity:0.5;pointer-events:none;cursor:default' : ''}"><img src="Icons/open-book.png" width="13" style="vertical-align:middle;margin-right:4px">${chapters.length ? 'Start Reading' : 'No Chapters Yet'}</a>
             <button class="btn btn-sm book-fav" data-book="${id}" style="background:${isFav?'rgba(255,255,255,0.15)':'var(--bg-hover)'}">${isFav?'Favorited':'Favorite'}</button>
-            ${chapters.length ? `<a class="btn btn-primary" href="#/book/${id}/read/${chapters[0].id}" style="text-decoration:none">Start Reading</a>` : ''}
-            ${state.loggedIn && !isAuthor ? (() => {
-  const td = new Date().toDateString();
-  const lv = state.user.level || 1;
-  const maxF = dailyFlameAllowance(lv);
-  const rem = serverOnline ? (state.flamesRemaining ?? maxF) : Math.max(0, maxF - (state.flameDate === td ? state.flamesGiven : 0));
-  return `<button class="btn btn-flame book-flame" data-book="${id}" style="padding:5px 10px">${rem > 0 ? 'Give ' + rem + ' Flame' + (rem > 1 ? 's' : '') : 'Given'}</button>`;
-})() : ''}
+            <button class="btn btn-flame book-flame" data-book="${id}" style="padding:8px 14px"><img src="Icons/fire.png" width="14" style="vertical-align:middle;margin-right:4px">${(() => {
+              if (!state.loggedIn) return 'Give Flame';
+              if (isAuthor) return 'Flame';
+              const td = new Date().toDateString();
+              const lv = state.user.level || 1;
+              const maxF = dailyFlameAllowance(lv);
+              const rem = serverOnline ? (state.flamesRemaining ?? maxF) : Math.max(0, maxF - (state.flameDate === td ? state.flamesGiven : 0));
+              return rem > 0 ? 'Give ' + rem + ' Flame' + (rem > 1 ? 's' : '') : 'Given';
+            })()}</button>
+            ${state.loggedIn && !isAuthor ? `<span class="flame-rule-tip" title="Flame rule: you only have 2 flames per day, every 00:00 new day, it resets">${flameStatusLine()}</span>` : ''}
           </div>
         </div>
       </div>
@@ -2118,32 +3560,14 @@ function renderBookPage(id) {
           </section>
           <section class="content-section">
             <h3 class="section-title">Reviews (${reviews.length})</h3>
+            ${avgRating(reviews) ? `<div class="review-avg-line"><span class="ral-ic">&#9733;</span> Community rating: <strong>${avgRating(reviews)}/5</strong> (${reviews.length} review${reviews.length === 1 ? '' : 's'})</div>` : ''}
             ${state.loggedIn ? `
             <form class="review-form" data-book="${id}">
+              ${reviewRatingFormHtml()}
               <textarea class="input-field review-input" name="content" placeholder="Write a review..." rows="3" required></textarea>
               <button type="submit" class="btn btn-primary" style="font-size:0.68rem;padding:6px 14px;margin-top:6px">Post Review</button>
             </form>` : `<p style="font-size:0.72rem;color:var(--text3);margin-bottom:12px"><a href="#/signin" style="color:var(--accent)">Sign in</a> to leave a review</p>`}
-            ${sortedReviews.length ? sortedReviews.map(r => `
-            <div class="review-item${r.pinned ? ' pinned' : ''}">
-              ${r.pinned ? '<div class="review-pinned-badge">Pinned Review</div>' : ''}
-              <div class="review-header">
-                <span class="review-avatar">${r.username[0]}</span>
-                <span class="review-author">${r.username}</span>
-                <span class="review-date">${r.editedAt ? r.editedAt + ' (edited)' : r.createdAt}</span>
-              </div>
-              <p class="review-text">${r.content}</p>
-              ${r.favorited ? '<div class="review-fav-badge">Author\'s Favorite</div>' : ''}
-              <div class="review-actions">
-                ${isAuthor ? `
-                  <button class="btn btn-sm review-pin-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px">${r.pinned ? 'Unpin' : 'Pin'}</button>
-                  <button class="btn btn-sm review-fav-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px">${r.favorited ? 'Unfavorite' : 'Favorite'}</button>
-                  <button class="btn btn-sm review-del-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px;color:var(--red)">Delete</button>
-                ` : state.loggedIn && r.username === state.user.username ? `
-                  <button class="btn btn-sm review-del-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px;color:var(--red)">Delete</button>
-                ` : ''}
-              </div>
-            </div>
-            `).join('') : '<p style="font-size:0.72rem;color:var(--text3);padding:16px 0;text-align:center">No reviews yet</p>'}
+            ${sortedReviews.length ? sortedReviews.map(r => reviewItemHtml(r, id, isAuthor)).join('') : '<p style="font-size:0.72rem;color:var(--text3);padding:16px 0;text-align:center">No reviews yet</p>'}
           </section>
         ` : bookTab==='Chapters' ? `
           <div class="chapter-grid">
@@ -2164,42 +3588,26 @@ function renderBookPage(id) {
         ` : bookTab==='Characters' ? `
           <div class="char-grid">
             ${chars.length ? chars.map(c => `
-            <div class="char-card">
-              <div class="${imageClass('char-card-img', c.image || c.portrait)}" data-img-url="${c.image || c.portrait || ''}" data-img-context="character:${c.id}" style="${imageBg(c.image || c.portrait, '')}">${(c.image || c.portrait) ? '' : imageFallback(c.name)}</div>
-              <h4 class="char-card-name">${c.name}</h4>
-              <span class="char-card-role">${c.role || 'Character'}</span>
-            </div>
+            <a class="char-card" href="#/book/${id}/character/${c.id}">
+              <div class="${imageClass('char-card-img', c.image || c.portrait)}" data-img-url="${c.image || c.portrait || ''}" data-img-context="character:${c.id}" style="${c.image || c.portrait ? imageBg(c.image || c.portrait, '') : 'background:var(--bg-hover)'}">${(c.image || c.portrait) ? '' : imageFallback(c.name)}</div>
+              <div class="char-card-body">
+                <h4 class="char-card-name">${c.name}</h4>
+                <span class="char-card-role">${c.nickname ? escHtml(c.nickname) : escHtml(c.role || 'Character')}</span>
+              </div>
+            </a>
             `).join('') : '<div class="empty-state" style="grid-column:1/-1"><h3>No characters yet</h3><p>Characters will appear here</p></div>'}
           </div>
         ` : bookTab==='Reviews' ? `
           <section class="content-section">
             <h3 class="section-title">Reviews (${reviews.length})</h3>
+            ${avgRating(reviews) ? `<div class="review-avg-line"><span class="ral-ic">&#9733;</span> Community rating: <strong>${avgRating(reviews)}/5</strong> (${reviews.length} review${reviews.length === 1 ? '' : 's'})</div>` : ''}
             ${state.loggedIn ? `
             <form class="review-form" data-book="${id}">
+              ${reviewRatingFormHtml()}
               <textarea class="input-field review-input" name="content" placeholder="Write a review..." rows="3" required></textarea>
               <button type="submit" class="btn btn-primary" style="font-size:0.68rem;padding:6px 14px;margin-top:6px">Post Review</button>
             </form>` : `<p style="font-size:0.72rem;color:var(--text3);margin-bottom:12px"><a href="#/signin" style="color:var(--accent)">Sign in</a> to leave a review</p>`}
-            ${sortedReviews.length ? sortedReviews.map(r => `
-            <div class="review-item${r.pinned ? ' pinned' : ''}">
-              ${r.pinned ? '<div class="review-pinned-badge">Pinned Review</div>' : ''}
-              <div class="review-header">
-                <span class="review-avatar">${r.username[0]}</span>
-                <span class="review-author">${r.username}</span>
-                <span class="review-date">${r.editedAt ? r.editedAt + ' (edited)' : r.createdAt}</span>
-              </div>
-              <p class="review-text">${r.content}</p>
-              ${r.favorited ? '<div class="review-fav-badge">Author\'s Favorite</div>' : ''}
-              <div class="review-actions">
-                ${isAuthor ? `
-                  <button class="btn btn-sm review-pin-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px">${r.pinned ? 'Unpin' : 'Pin'}</button>
-                  <button class="btn btn-sm review-fav-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px">${r.favorited ? 'Unfavorite' : 'Favorite'}</button>
-                  <button class="btn btn-sm review-del-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px;color:var(--red)">Delete</button>
-                ` : state.loggedIn && r.username === state.user.username ? `
-                  <button class="btn btn-sm review-del-btn" data-book="${id}" data-review="${r.id}" style="font-size:0.55rem;padding:3px 8px;color:var(--red)">Delete</button>
-                ` : ''}
-              </div>
-            </div>
-            `).join('') : '<p style="font-size:0.72rem;color:var(--text3);padding:16px 0;text-align:center">No reviews yet</p>'}
+            ${sortedReviews.length ? sortedReviews.map(r => reviewItemHtml(r, id, isAuthor)).join('') : '<p style="font-size:0.72rem;color:var(--text3);padding:16px 0;text-align:center">No reviews yet</p>'}
           </section>
         ` : bookTab==='Supporters' ? `
           <section class="content-section">
@@ -2237,6 +3645,46 @@ function renderBookPage(id) {
     </div>`;
 }
 
+// ---- Character Detail Page ----
+function renderCharacterPage(bookId, charId) {
+  const book = getBook(bookId);
+  if (!book) return '<div class="page"><h2>Book not found</h2></div>';
+  const isAuthor = state.loggedIn && book.author === state.user.username;
+  if (!isAuthor && !isPublicBook(book)) return '<div class="page"><h2>Book not found</h2></div>';
+  const c = (state.characters[bookId] || []).find(x => x.id === charId);
+  if (!c) return '<div class="page"><h2>Character not found</h2></div>';
+  const img = c.image || c.portrait || '';
+  const facts = [['Nickname', c.nickname], ['Age', c.age], ['Height', c.height], ['Weight', c.weight], ['Role', c.role || 'Character']].filter(([, v]) => v && String(v).trim());
+  return `
+    <div class="page char-detail-page">
+      <a class="back-link" href="#/book/${bookId}"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back to ${escHtml(book.title)}</a>
+      ${isAuthor ? `<div class="char-detail-manage"><a class="btn btn-sm" href="#/write/works/${bookId}/characters/${charId}" style="text-decoration:none"><img src="Icons/editpen.png" width="12" style="vertical-align:middle;margin-right:4px">Edit in Your Workspace</a></div>` : ''}
+
+      <div class="char-detail-hero">
+        <div class="${imageClass('char-detail-img', img)}" data-img-url="${img}" data-img-context="character-detail:${c.id}" style="${img ? imageBg(img, '') : 'background:var(--bg-hover)'}">${img ? '' : `<span class="char-detail-fallback">${imageFallback(c.name)}</span>`}</div>
+        <div class="char-detail-head">
+          <h1 class="char-detail-name">${escHtml(c.name)}</h1>
+          ${c.nickname ? `<div class="char-detail-nick">"${escHtml(c.nickname)}"</div>` : ''}
+          ${c.role ? `<span class="char-detail-role">${escHtml(c.role)}</span>` : ''}
+        </div>
+      </div>
+
+      ${facts.length ? `
+      <div class="char-detail-facts">
+        ${facts.map(([l, v]) => `
+        <div class="char-fact-card">
+          <span class="char-fact-lbl">${l}</span>
+          <span class="char-fact-val">${escHtml(v)}</span>
+        </div>`).join('')}
+      </div>` : ''}
+
+      <section class="content-section char-detail-desc">
+        <h3 class="section-title">About ${escHtml(c.name)}</h3>
+        ${c.description ? c.description.split(/\r?\n\s*\r?\n/).map(p => `<p class="char-detail-p">${renderRichContent(p)}</p>`).join('') : '<p style="font-size:0.7rem;color:var(--text3);font-style:italic">No description yet</p>'}
+      </section>
+    </div>`;
+}
+
 // ---- Chapter Reader ----
 function renderChapterReader(bookId, chapterId) {
   const book = getBook(bookId);
@@ -2247,6 +3695,9 @@ function renderChapterReader(bookId, chapterId) {
   const ch = chapters.find(c => c.id === chapterId);
   if (!ch) return '<div class="page"><h2>Chapter not found</h2></div>';
   if (!isAuthor && !ch.published) return '<div class="page"><h2>Chapter not found</h2></div>';
+
+  // Record chapter view (once per book+chapter+day)
+  recordView(bookId, chapterId);
 
   // Save reading progress
   if (state.loggedIn) {
@@ -2291,16 +3742,92 @@ function renderChapterReader(bookId, chapterId) {
   const flameRules = `${maxF}/day`;
 
   // Comments
-  const chComments = getChapterComments(bookId, chapterId);
+  const chComments = getChapterComments(bookId, chapterId).filter(c => c.para === undefined);
+
+  // Reader content (continuous scroll or page-by-page)
+  const blocks = chapterBlocks(ch.content);
+  const paged = state.readerScrollMode === 'paged';
+  if (paged && state._readerFor !== chapterId) {
+    state.readerPageIndex = 0;
+    state._readerFor = chapterId;
+  }
+  let contentHtml;
+  let pageNavHtml = '';
+  if (!paged) {
+    contentHtml = blocks.map((b, i) => paragraphHtml(bookId, chapterId, b, i)).join('');
+  } else {
+    const pages = paginateBlocks(blocks, 1600);
+    const pi = Math.min(state.readerPageIndex || 0, pages.length - 1);
+    state.readerPageIndex = pi;
+    pageNavHtml = `<div class="reader-page-nav">
+      <button class="btn btn-sm rd-page-prev" ${pi <= 0 ? 'disabled' : ''} style="font-size:0.6rem">&#8249; Prev</button>
+      <span class="reader-page-count">Page ${pi + 1} / ${pages.length}</span>
+      <button class="btn btn-sm rd-page-next" ${pi >= pages.length - 1 ? 'disabled' : ''} style="font-size:0.6rem">Next &#8250;</button>
+    </div>`;
+    let acc = 0;
+    pages.slice(0, pi).forEach(p => { acc += p.length; });
+    contentHtml = pageNavHtml + pages[pi].map((b, k) => paragraphHtml(bookId, chapterId, b, acc + k)).join('');
+  }
+  const readerFont = Math.max(0.8, Math.min(1.6, +(state.readerFontSize || 1)));
 
   return `
     <div class="page reader-page">
       <div class="reader-header">
         <a class="back-link" href="#/book/${bookId}" style="padding:0"><img src="Icons/open-book.png" width="14" style="vertical-align:middle;margin-right:4px">Back to Book</a>
         <span class="reader-chapter-info">Ch. ${ch.chapterNumber} &middot; ${ch.title}</span>
+        <span class="reader-header-actions">
+          <a class="btn btn-sm rd-comments-link" href="#/book/${bookId}/comments/${chapterId}" style="font-size:0.6rem;padding:3px 8px"><img src="Icons/inbox.png" width="12" style="vertical-align:middle;margin-right:4px">Comments</a>
+          <button class="btn btn-sm rd-menu-toggle" style="font-size:0.6rem;padding:3px 8px"><img src="Icons/settings.png" width="12" style="vertical-align:middle;margin-right:4px">Menu</button>
+        </span>
       </div>
       <h1 class="reader-title">${ch.title}</h1>
-      <div class="reader-content">${ch.content}</div>
+      <div class="reader-content" id="reader-content" data-book="${bookId}" data-chapter="${chapterId}" style="font-size:${readerFont}rem">${contentHtml}</div>
+
+      <!-- Paragraph Comment Modal -->
+      <div class="para-modal" id="para-comment-modal" style="display:none">
+        <div class="para-overlay"></div>
+        <div class="para-panel">
+          <div class="para-header">
+            <span style="font-weight:600;font-size:0.85rem">Paragraph Comments</span>
+            <button class="btn btn-sm para-close" style="font-size:0.65rem">x</button>
+          </div>
+          ${state.loggedIn ? `
+          <form class="para-form" style="display:flex;gap:6px;padding:10px 14px;border-bottom:1px solid var(--line2)">
+            <textarea class="input-field" name="content" rows="1" placeholder="Comment on this paragraph..." style="flex:1;font-size:0.7rem;resize:none"></textarea>
+            <button type="submit" class="btn btn-primary" style="font-size:0.62rem;padding:4px 10px;align-self:center">Post</button>
+          </form>` : ''}
+          <div class="para-body" id="para-body" style="overflow-y:auto;max-height:50vh;padding:4px 0"></div>
+        </div>
+      </div>
+
+      <!-- Highlighted Passage Modal -->
+      <div class="hl-modal" id="hl-modal" style="display:none">
+        <div class="hl-overlay"></div>
+        <div class="hl-panel">
+          <div class="hl-header">
+            <span style="font-weight:600;font-size:0.85rem">Highlighted Passage</span>
+            <button class="btn btn-sm hl-close" style="font-size:0.65rem">x</button>
+          </div>
+          <div class="hl-quote" id="hl-quote"></div>
+          ${state.loggedIn ? `
+          <form class="hl-form" style="display:flex;gap:6px;padding:10px 14px;border-bottom:1px solid var(--line2)">
+            <textarea class="input-field" name="content" rows="1" placeholder="Comment on this passage..." style="flex:1;font-size:0.7rem;resize:none"></textarea>
+            <button type="submit" class="btn btn-primary" style="font-size:0.62rem;padding:4px 10px;align-self:center">Comment</button>
+          </form>` : `<p class="hl-login" style="padding:8px 14px;font-size:0.65rem;color:var(--text3);border-bottom:1px solid var(--line2)"><a href="#/signin" style="color:var(--accent)">Sign in</a> to comment on this passage</p>`}
+          <div class="hl-body" id="hl-body" style="overflow-y:auto;max-height:50vh;padding:4px 0"></div>
+        </div>
+      </div>
+
+      <!-- Image Zoom Overlay -->
+      <div class="img-zoom-overlay" id="img-zoom-overlay" style="display:none">
+        <div class="img-zoom-toolbar">
+          <button class="img-zoom-btn" id="img-zoom-out">Zoom Out</button>
+          <span class="img-zoom-scale" id="img-zoom-scale">100%</span>
+          <button class="img-zoom-btn" id="img-zoom-in">Zoom In</button>
+          <button class="img-zoom-btn" id="img-zoom-close">Close</button>
+        </div>
+        <img id="img-zoom-image" alt="Zoomed image">
+      </div>
 
       <!-- End of Chapter -->
       <div class="end-section">
@@ -2322,6 +3849,7 @@ function renderChapterReader(bookId, chapterId) {
             <span>Lv 5-10: 3/day</span>
             <span>Lv 11-20: 4/day</span>
             <span>Lv 21+: 5/day</span>
+            <span class="flame-rule-tip" style="width:auto">${flameStatusLine()}</span>
           </div>
         </div>` : ''}
 
@@ -2345,17 +3873,7 @@ function renderChapterReader(bookId, chapterId) {
             <button type="submit" class="btn btn-primary" style="font-size:0.65rem;padding:5px 12px">Post Comment</button>
           </form>` : `<p class="end-comment-login" style="font-size:0.65rem;color:var(--text3);margin-bottom:10px"><a href="#/signin" style="color:var(--accent)">Sign in</a> to comment</p>`}
           <div class="ch-comments">
-            ${chComments.length ? chComments.map(c => `
-            <div class="ch-comment-item">
-              <span class="ch-comment-avatar">${c.username[0]}</span>
-              <div class="ch-comment-body">
-                <span class="ch-comment-author">${c.username}</span>
-                <span class="ch-comment-date">${c.createdAt}</span>
-                <p class="ch-comment-text">${c.content}</p>
-              </div>
-              ${state.loggedIn && (c.username === state.user.username || book.author === state.user.username) ? `<button class="btn btn-sm ch-comment-del" data-book="${bookId}" data-chapter="${chapterId}" data-comment="${c.id}" style="font-size:0.5rem;padding:2px 6px;color:var(--red);flex-shrink:0">x</button>` : ''}
-            </div>
-            `).join('') : '<p style="font-size:0.65rem;color:var(--text3);text-align:center;padding:8px 0">No comments yet</p>'}
+            ${chComments.length ? chComments.map(c => chCommentHtml(c, bookId, chapterId, book.author)).join('') : '<p style="font-size:0.65rem;color:var(--text3);text-align:center;padding:8px 0">No comments yet</p>'}
           </div>
         </div>
 
@@ -2366,6 +3884,31 @@ function renderChapterReader(bookId, chapterId) {
           ${nextCh ? `<a class="btn btn-primary" href="#/book/${bookId}/read/${nextCh.id}">Next <img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-left:4px"></a>` : `<a class="btn btn-sm" href="#/book/${bookId}"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back to Book</a>`}
         </div>
 
+      </div>
+    </div>
+
+    <!-- Reader Settings Sheet -->
+    <div class="reader-sheet" id="reader-sheet">
+      <div class="reader-sheet-overlay"></div>
+      <div class="reader-sheet-panel">
+        <div class="reader-sheet-title">Reader Settings <button class="btn btn-sm rd-sheet-close" style="font-size:0.65rem">x</button></div>
+        <div class="reader-sheet-row">
+          <span class="reader-sheet-label">Font Size</span>
+          <span class="reader-sheet-btns">
+            <button class="btn btn-sm rd-font-minus" style="font-size:0.7rem;padding:4px 10px;background:var(--bg-hover)">A&#8722;</button>
+            <span class="rd-font-val">${readerFont.toFixed(1)}</span>
+            <button class="btn btn-sm rd-font-plus" style="font-size:0.85rem;padding:4px 10px;background:var(--bg-hover)">A+</button>
+          </span>
+        </div>
+        <div class="reader-sheet-row">
+          <span class="reader-sheet-label">Scroll Mode</span>
+          <button class="btn btn-sm rd-scroll-toggle" style="font-size:0.65rem;padding:4px 10px;background:var(--bg-hover);color:var(--accent)">${paged ? 'Page by Page' : 'Continuous'}</button>
+        </div>
+        <div class="reader-sheet-actions">
+          <button class="btn btn-sm rd-chapter-list" data-book="${bookId}" style="font-size:0.62rem;padding:4px 10px">Chapters</button>
+          <a class="btn btn-sm" href="#/book/${bookId}/comments/${chapterId}" style="font-size:0.62rem;padding:4px 10px">Comments</a>
+          <a class="btn btn-sm" href="#/book/${bookId}" style="font-size:0.62rem;padding:4px 10px">Book Page</a>
+        </div>
       </div>
     </div>
 
@@ -2387,6 +3930,92 @@ function renderChapterReader(bookId, chapterId) {
           `).join('')}
         </div>
       </div>
+    </div>`;
+}
+
+function renderChapterComments(bookId, chapterId) {
+  const book = getBook(bookId);
+  if (!book) return '<div class="page"><h2>Book not found</h2></div>';
+  const isAuthor = state.loggedIn && book.author === state.user.username;
+  if (!isAuthor && !isPublicBook(book)) return '<div class="page"><h2>Book not found</h2></div>';
+  const chapters = state.chapters[bookId] || [];
+  const ch = chapters.find(c => c.id === chapterId);
+  if (!ch) return '<div class="page"><h2>Chapter not found</h2></div>';
+  if (!isAuthor && !ch.published) return '<div class="page"><h2>Chapter not found</h2></div>';
+  const chComments = getChapterComments(bookId, chapterId).filter(c => c.para === undefined);
+  const paraCount = getChapterComments(bookId, chapterId).filter(c => c.para !== undefined).length;
+  return `
+    <div class="page reader-page">
+      <div class="reader-header">
+        <a class="back-link" href="#/book/${bookId}/read/${chapterId}" style="padding:0"><img src="Icons/open-book.png" width="14" style="vertical-align:middle;margin-right:4px">Back to Reader</a>
+        <span class="reader-chapter-info">Ch. ${ch.chapterNumber} &middot; ${ch.title}</span>
+        <span class="reader-header-actions" style="font-size:0.55rem;color:var(--text3)">${paraCount} paragraph comment${paraCount === 1 ? '' : 's'}</span>
+      </div>
+      <h1 class="reader-title">Chapter Discussion</h1>
+      <div class="end-card" style="text-align:left">
+        <div class="end-card-label"><img src="Icons/inbox.png" width="14" style="vertical-align:middle;margin-right:6px">Comments on this chapter</div>
+        ${state.loggedIn ? `
+        <form class="ch-comment-form" data-book="${bookId}" data-chapter="${chapterId}" style="margin-bottom:10px">
+          <textarea class="input-field" name="content" placeholder="Comment on this chapter..." rows="2" style="margin-bottom:6px"></textarea>
+          <button type="submit" class="btn btn-primary" style="font-size:0.65rem;padding:5px 12px">Post Comment</button>
+        </form>` : `<p class="end-comment-login" style="font-size:0.65rem;color:var(--text3);margin-bottom:10px"><a href="#/signin" style="color:var(--accent)">Sign in</a> to comment</p>`}
+        <div class="ch-comments">
+          ${chComments.length ? chComments.map(c => chCommentHtml(c, bookId, chapterId, book.author)).join('') : '<p style="font-size:0.65rem;color:var(--text3);text-align:center;padding:8px 0">No comments yet</p>'}
+        </div>
+      </div>
+    </div>`;
+}
+
+// ---- Workspace: highlighted passages management ----
+function hlManageRowHtml(bookId, chapterId, rec, bookAuthor) {
+  const rows = (rec.comments || []).map(c => {
+    const canMod = state.loggedIn && (c.username === state.user.username || bookAuthor === state.user.username);
+    return `
+      <div class="ch-comment-item">
+        <span class="ch-comment-avatar">${escHtml(String(c.username || '?')[0])}</span>
+        <div class="ch-comment-body">
+          <span class="ch-comment-author">${escHtml(c.username)}</span>
+          <span class="ch-comment-date">${c.createdAt}</span>
+          <p class="ch-comment-text">${escHtml(c.content)}</p>
+          ${canMod ? `<button class="btn btn-sm hl-del" data-book="${bookId}" data-chapter="${chapterId}" data-hl="${rec.id}" data-para="${rec.para}" data-comment="${c.id}" style="font-size:0.5rem;padding:2px 6px;color:var(--red);flex-shrink:0">Delete</button>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+  return `
+    <div class="hl-manage-card">
+      <div class="hl-manage-head">
+        <span class="hl-manage-meta">Para ${rec.para + 1} &middot; ${(rec.comments || []).length} comment${(rec.comments || []).length === 1 ? '' : 's'}</span>
+        <button class="btn btn-sm hl-del-rec" data-book="${bookId}" data-chapter="${chapterId}" data-hl="${rec.id}" style="font-size:0.55rem;padding:3px 8px;color:var(--red)">Delete Highlight</button>
+      </div>
+      <blockquote class="hl-manage-quote">&#8220;${escHtml(rec.text)}&#8221;</blockquote>
+      <div class="hl-comments">${rows || '<p style="font-size:0.6rem;color:var(--text3);padding:4px 0">No comments yet</p>'}</div>
+    </div>`;
+}
+
+function renderHighlightsPage(bookId) {
+  const book = getBook(bookId);
+  const isAuthor = state.loggedIn && book && book.author === state.user.username;
+  if (!book || !isAuthor) return '<div class="page"><h2>Book not found</h2></div>';
+  const groups = getAllBookHighlights(bookId);
+  const totalHls = groups.reduce((s, g) => s + g.highlights.length, 0);
+  return `
+    <div class="page">
+      <a class="back-link" href="#/write/works/${bookId}" style="padding:0"><img src="Icons/open-book.png" width="14" style="vertical-align:middle;margin-right:4px">Back to Workspace</a>
+      <div class="book-settings-header" style="margin-bottom:14px">
+        <div style="display:flex;align-items:center;gap:12px">
+          <div>
+            <div class="book-settings-title">Highlights &amp; Passage Comments</div>
+            <span class="book-settings-genre">${book.title} &middot; ${totalHls} highlight${totalHls === 1 ? '' : 's'}</span>
+          </div>
+        </div>
+      </div>
+      <p style="font-size:0.68rem;color:var(--text3);margin-bottom:14px">Readers highlight a passage in a chapter and attach a comment to it. You can view and delete them here.</p>
+      ${groups.length ? groups.map(g => `
+        <section class="content-section">
+          <h3 class="section-title">Ch. ${g.chapter.chapterNumber} &middot; ${escHtml(g.chapter.title || 'Untitled')} <span style="font-size:0.55rem;color:var(--text3);font-weight:400">(${g.highlights.length})</span></h3>
+          ${g.highlights.map(h => hlManageRowHtml(bookId, g.chapter.id, h, book.author)).join('')}
+        </section>`).join('')
+      : '<div class="empty-state"><h3>No highlights yet</h3><p>Readers can highlight a passage and comment on it while reading your chapters.</p></div>'}
     </div>`;
 }
 
@@ -2432,28 +4061,66 @@ function bindPageEvents(route) {
     }
   }
 
-  // ---- Create Character form ----
+  // ---- Character forms (create / edit) ----
+  const preview = document.getElementById('char-portrait-preview');
+  const fileInput = document.getElementById('char-portrait-input');
+  if (preview && fileInput) {
+    const applyToPreview = (dataUrl) => {
+      preview.dataset.image = dataUrl;
+      preview.style.backgroundImage = 'url(' + dataUrl + ')';
+      preview.textContent = '';
+    };
+    preview.addEventListener('click', () => fileInput.click());
+    const uploadBtn = document.querySelector('.char-upload-btn');
+    if (uploadBtn) uploadBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files[0];
+      if (!f) return;
+      fileInput.value = '';
+      charCropOpen(f, applyToPreview);
+    });
+    document.querySelectorAll('.char-remove-img').forEach(el => {
+      el.addEventListener('click', () => {
+        delete preview.dataset.image;
+        preview.style.backgroundImage = '';
+        preview.textContent = '+';
+      });
+    });
+  }
+  bindCharCropper();
+
   const charForm = document.getElementById('create-character-form');
   if (charForm) {
-    const preview = document.getElementById('char-portrait-preview');
-    const fileInput = document.getElementById('char-portrait-input');
-    if (preview && fileInput) {
-      preview.addEventListener('click', () => fileInput.click());
-      fileInput.addEventListener('change', () => {
-        const f = fileInput.files[0];
-        if (!f) return;
-        const r = new FileReader();
-        r.onload = () => { preview.style.backgroundImage = 'url(' + r.result + ')'; preview.textContent = ''; preview.dataset.image = r.result; };
-        r.readAsDataURL(f);
-      });
-    }
     charForm.addEventListener('submit', e => {
       e.preventDefault();
       const fd = new FormData(charForm);
       const bookId = charForm.dataset.book;
-      const data = { name: fd.get('name'), role: fd.get('role'), description: fd.get('description'), image: preview ? preview.dataset.image || '' : '' };
+      const data = {
+        name: fd.get('name'), nickname: fd.get('nickname'), age: fd.get('age'),
+        height: fd.get('height'), weight: fd.get('weight'),
+        role: fd.get('role'), description: fd.get('description'),
+        image: preview ? preview.dataset.image || '' : ''
+      };
       if (!data.name.trim()) return;
       createCharacter(bookId, data);
+      navigate('#/write/works/' + bookId);
+    });
+  }
+
+  const editCharForm = document.getElementById('edit-character-form');
+  if (editCharForm) {
+    editCharForm.addEventListener('submit', e => {
+      e.preventDefault();
+      const fd = new FormData(editCharForm);
+      const bookId = editCharForm.dataset.book, charId = editCharForm.dataset.char;
+      const data = {
+        name: fd.get('name'), nickname: fd.get('nickname'), age: fd.get('age'),
+        height: fd.get('height'), weight: fd.get('weight'),
+        role: fd.get('role'), description: fd.get('description'),
+        image: preview ? preview.dataset.image || '' : ''
+      };
+      if (!data.name.trim()) return;
+      updateCharacter(bookId, charId, data);
       navigate('#/write/works/' + bookId);
     });
   }
@@ -2499,7 +4166,7 @@ function bindPageEvents(route) {
       e.stopPropagation();
       if (!confirm('Delete this character?')) return;
       deleteCharacter(el.dataset.book, el.dataset.char);
-      render();
+      navigate('#/write/works/' + el.dataset.book);
     });
   });
 
@@ -2558,6 +4225,33 @@ function bindPageEvents(route) {
       });
     });
   }
+
+  // ---- Editor: Bold / Italic formatting ----
+  document.querySelectorAll('.ed-fmt').forEach(btn => {
+    btn.addEventListener('mousedown', e => e.preventDefault());
+    btn.addEventListener('click', () => {
+      const toolbar = btn.closest('.editor-toolbar');
+      const ta = toolbar ? toolbar.nextElementSibling : null;
+      const editorContentEl = (ta && ta.tagName === 'TEXTAREA') ? ta : document.getElementById('editor-content');
+      if (!editorContentEl) return;
+      const fmt = btn.dataset.fmt;
+      const start = editorContentEl.selectionStart;
+      const end = editorContentEl.selectionEnd;
+      const val = editorContentEl.value || '';
+      let selected = val.slice(start, end);
+      // Toggle: if already wrapped, unwrap
+      if (selected.startsWith(fmt) && selected.endsWith(fmt) && selected.length > fmt.length * 2) {
+        editorContentEl.value = val.slice(0, start) + selected.slice(fmt.length, selected.length - fmt.length) + val.slice(end);
+        editorContentEl.setSelectionRange(start, start + selected.length - fmt.length * 2);
+      } else {
+        const wrap = selected ? selected : 'text';
+        editorContentEl.value = val.slice(0, start) + fmt + wrap + fmt + val.slice(end);
+        editorContentEl.setSelectionRange(start + fmt.length, start + fmt.length + wrap.length);
+      }
+      editorContentEl.focus();
+      editorContentEl.dispatchEvent(new Event('input'));
+    });
+  });
 
   // ---- Editor revisions ----
   document.querySelectorAll('.ed-revisions').forEach(el => {
@@ -2762,13 +4456,27 @@ function bindPageEvents(route) {
 
   // ---- Review form ----
   document.querySelectorAll('.review-form').forEach(form => {
+    form.querySelectorAll('.star').forEach(st => {
+      st.addEventListener('click', () => {
+        const row = st.closest('.rev-rate-row');
+        const val = +st.dataset.val;
+        row.querySelectorAll('.star').forEach(s => s.classList.toggle('on', +s.dataset.val <= val));
+        recomputeReviewOverall(form);
+      });
+    });
     form.addEventListener('submit', e => {
       e.preventDefault();
       const bookId = form.dataset.book;
       const input = form.querySelector('.review-input');
       const content = input?.value?.trim();
       if (!content) return;
-      createReview(bookId, { content });
+      const ratings = {};
+      form.querySelectorAll('.rev-rate-row').forEach(row => {
+        const on = row.querySelector('.star.on');
+        if (on) ratings[row.dataset.cat] = +on.dataset.val;
+      });
+      REVIEW_CATEGORIES.forEach(c => { if (!ratings[c.key]) ratings[c.key] = 5; });
+      createReview(bookId, { content, ratings });
       render();
     });
   });
@@ -2792,6 +4500,26 @@ function bindPageEvents(route) {
     });
   });
 
+  // ---- Review reply (toggle form + submit) ----
+  document.querySelectorAll('.review-reply-btn').forEach(el => {
+    el.addEventListener('click', () => {
+      const book = el.dataset.book, review = el.dataset.review;
+      const form = document.querySelector(`.review-reply-form[data-book="${book}"][data-review="${review}"]`);
+      if (form) form.style.display = form.style.display === 'none' ? '' : 'none';
+    });
+  });
+  document.querySelectorAll('.review-reply-form').forEach(form => {
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const book = form.dataset.book, review = form.dataset.review;
+      const input = form.querySelector('input[name="content"]');
+      const content = input?.value?.trim();
+      if (!content) return;
+      replyToReview(book, review, content);
+      render();
+    });
+  });
+
   // ---- Book favorite ----
   document.querySelectorAll('.book-fav').forEach(el => {
     el.addEventListener('click', () => { toggleFavorite(el.dataset.book); render(); });
@@ -2800,6 +4528,7 @@ function bindPageEvents(route) {
   // ---- Book flames ----
   document.querySelectorAll('.book-flame').forEach(el => {
     el.addEventListener('click', () => {
+      if (!state.loggedIn) { navigate('#/signin'); return; }
       if (giveFlames(el.dataset.book)) {
         saveState();
         render();
@@ -2810,6 +4539,59 @@ function bindPageEvents(route) {
   // ---- Theme selection ----
   document.querySelectorAll('[data-theme-btn]').forEach(el => {
     el.addEventListener('click', () => { state.theme = el.dataset.themeBtn; saveState(); render(); });
+  });
+
+  // ---- Inbox tabs ----
+  document.querySelectorAll('[data-inbox-tab]').forEach(el => {
+    el.addEventListener('click', () => { inboxTab = el.dataset.inboxTab; render(); });
+  });
+
+  // ---- Inbox: refresh notifications ----
+  const inboxRefresh = document.getElementById('inbox-refresh');
+  if (inboxRefresh) {
+    inboxRefresh.addEventListener('click', async () => {
+      if (!serverOnline) return;
+      const notifs = await apiFetch('/api/user/notifications');
+      if (notifs && Array.isArray(notifs)) {
+        const local = (state.notifications || []).filter(n => n.local);
+        state.notifications = local.concat(notifs);
+        saveState();
+        render();
+      }
+    });
+  }
+
+  // ---- Inbox: mark all notifications read ----
+  const markNotifsBtn = document.getElementById('inbox-mark-notifs-read');
+  if (markNotifsBtn) {
+    markNotifsBtn.addEventListener('click', () => {
+      (state.notifications || []).forEach(n => n.read = 1);
+      saveState();
+      if (serverOnline) apiSync('PUT', '/api/user/notifications/read-all');
+      render();
+    });
+  }
+
+  // ---- Inbox: mark all messages read ----
+  const markMsgsBtn = document.getElementById('inbox-mark-msgs-read');
+  if (markMsgsBtn) {
+    markMsgsBtn.addEventListener('click', () => {
+      (state.messages || []).forEach(m => { if (m.to === state.user.username) m.read = true; });
+      saveState();
+      render();
+    });
+  }
+
+  // ---- Inbox: tap item opens link / reads ----
+  document.querySelectorAll('.inbox-item').forEach(el => {
+    el.addEventListener('click', e => {
+      if (e.target.closest('a')) return;
+      if (e.target.closest('.inbox-read-btn')) return;
+      const link = el.querySelector('a.inbox-item-link');
+      if (link && link.getAttribute('href') && link.getAttribute('href') !== '#/inbox') {
+        navigate(link.getAttribute('href'));
+      }
+    });
   });
 
   // ---- Author tabs ----
@@ -2877,21 +4659,36 @@ function bindPageEvents(route) {
   // ---- Follow author ----
   document.querySelectorAll('.author-follow-btn').forEach(el => {
     el.addEventListener('click', () => {
-      state.user.followers += 1;
+      const author = el.dataset.author;
+      if (!state.following) state.following = [];
+      if (state.following.includes(author)) return;
+      state.following.push(author);
+      if (state.user.username === author) state.user.followers = (state.user.followers || 0) + 1;
       saveState();
       render();
     });
   });
 
-  // ---- Support author ----
+  // ---- Support author (uses your available flame budget) ----
+  const currentRemaining = () => {
+    if (serverOnline) return Math.max(0, state.flamesRemaining ?? dailyFlameAllowance(state.user.level || 1));
+    const td = new Date().toDateString();
+    if (state.flameDate !== td) return dailyFlameAllowance(state.user.level || 1);
+    return Math.max(0, dailyFlameAllowance(state.user.level || 1) - state.flamesGiven);
+  };
   document.querySelectorAll('.author-support-btn').forEach(el => {
     el.addEventListener('click', () => {
-      const amount = prompt('Enter flame amount to send:', '10');
+      const max = currentRemaining();
+      if (max <= 0) { alert('You have no flames left today. They reset at 00:00.'); return; }
+      const amount = prompt(`How many flames to send? (You have ${max} today):`, String(max));
       if (!amount) return;
       const num = parseInt(amount);
       if (isNaN(num) || num <= 0) return;
+      const send = Math.min(num, max);
       const giver = state.user.username;
-      state.supporterHistory.push({ user: giver, amount: num, date: new Date().toISOString() });
+      if (serverOnline) state.flamesRemaining = Math.max(0, (state.flamesRemaining || 0) - send);
+      else state.flamesGiven = (state.flamesGiven || 0) + send;
+      state.supporterHistory.push({ user: giver, amount: send, date: new Date().toISOString() });
       saveState();
       render();
     });
@@ -3015,13 +4812,10 @@ function bindPageEvents(route) {
     });
   }
 
-  // ---- Inbox Toggle ----
-  const inboxToggle = document.getElementById('prof-inbox-toggle');
-  if (inboxToggle) {
-    inboxToggle.addEventListener('click', () => {
-      const inbox = document.getElementById('prof-inbox');
-      if (inbox) { inbox.style.display = inbox.style.display === 'none' ? 'block' : 'none'; }
-    });
+  // ---- Inbox badge (header) ----
+  const inboxBadge = document.getElementById('inbox-badge');
+  if (inboxBadge) {
+    inboxBadge.addEventListener('click', () => navigate('#/inbox'));
   }
 
   // ---- Profile: Banner Upload ----
@@ -3136,35 +4930,14 @@ function bindPageEvents(route) {
   document.querySelectorAll('.rd-give-flame').forEach(el => {
     el.addEventListener('click', function() {
       const bookId = this.dataset.book;
-      const fb = document.getElementById('flame-feedback');
-      if (serverOnline) {
-        const chs = state.chapters[bookId];
-        const chId = chs && chs.length ? chs[chs.length-1].id : null;
-        const promise = chId ? syncGiveSingleFlame(chId) : syncGiveFlame(bookId);
-        promise.then(res => {
-          if (res) {
-            const book = getBook(bookId);
-            if (book) book.flames = res.bookFlames;
-            state.flamesRemaining = res.remaining;
-            if (res.expReward) applyExpReward(res.expReward);
-            saveState();
-            if (fb) {
-              fb.style.display = 'block';
-              fb.classList.add('flame-anim');
-              setTimeout(() => { fb.classList.remove('flame-anim'); render(); }, 1200);
-            } else { render(); }
-          }
-        });
-      } else {
-        if (giveSingleFlame(bookId)) {
-          saveState();
-          gainExp(10, 'flame');
-          if (fb) {
-            fb.style.display = 'block';
-            fb.classList.add('flame-anim');
-            setTimeout(() => { fb.classList.remove('flame-anim'); render(); }, 1200);
-          } else { render(); }
-        }
+      if (giveSingleFlame(bookId)) {
+        saveState();
+        const fb = document.getElementById('flame-feedback');
+        if (fb) {
+          fb.style.display = 'block';
+          fb.classList.add('flame-anim');
+          setTimeout(() => { fb.classList.remove('flame-anim'); render(); }, 1200);
+        } else { render(); }
       }
     });
   });
@@ -3192,6 +4965,18 @@ function bindPageEvents(route) {
     });
   });
 
+  // ---- Reader: Reply to Chapter Comment ----
+  document.querySelectorAll('.ch-comment-reply-form').forEach(form => {
+    form.addEventListener('submit', function(e) {
+      e.preventDefault();
+      const input = this.querySelector('[name="content"]');
+      const content = input?.value?.trim();
+      if (!content) return;
+      replyToChapterComment(this.dataset.book, this.dataset.chapter, this.dataset.comment, content);
+      render();
+    });
+  });
+
   // ---- Reader: Show Chapter List ----
   document.querySelectorAll('.rd-chapter-list').forEach(el => {
     el.addEventListener('click', function() {
@@ -3211,6 +4996,155 @@ function bindPageEvents(route) {
     el.addEventListener('click', function() {
       const modal = document.getElementById('ch-list-modal');
       if (modal) modal.style.display = 'none';
+    });
+  });
+
+  // ---- Reader: Image Zoom ----
+  const zoomOverlay = document.getElementById('img-zoom-overlay');
+  const zoomImage = document.getElementById('img-zoom-image');
+  let zoomLevel = 1;
+  const ZOOM_MIN = 0.5, ZOOM_MAX = 4, ZOOM_STEP = 0.25;
+
+  function updateZoomDisplay() {
+    const scale = document.getElementById('img-zoom-scale');
+    if (scale) scale.textContent = Math.round(zoomLevel * 100) + '%';
+    if (zoomImage) zoomImage.style.transform = 'scale(' + zoomLevel + ')';
+  }
+  function openZoom(src) {
+    if (!zoomOverlay || !zoomImage) return;
+    zoomLevel = 1;
+    zoomImage.src = src;
+    zoomOverlay.style.display = 'flex';
+    updateZoomDisplay();
+    document.body.style.overflow = 'hidden';
+  }
+  function closeZoom() {
+    if (!zoomOverlay) return;
+    zoomOverlay.style.display = 'none';
+    document.body.style.overflow = '';
+  }
+
+  document.querySelectorAll('.reader-img').forEach(el => {
+    el.addEventListener('click', () => openZoom(el.dataset.zoomSrc || el.src));
+  });
+  if (zoomOverlay) {
+    zoomOverlay.addEventListener('click', e => {
+      if (e.target === zoomOverlay) closeZoom();
+    });
+  }
+  document.getElementById('img-zoom-close')?.addEventListener('click', closeZoom);
+  document.getElementById('img-zoom-in')?.addEventListener('click', () => {
+    zoomLevel = Math.min(ZOOM_MAX, zoomLevel + ZOOM_STEP); updateZoomDisplay();
+  });
+  document.getElementById('img-zoom-out')?.addEventListener('click', () => {
+    zoomLevel = Math.max(ZOOM_MIN, zoomLevel - ZOOM_STEP); updateZoomDisplay();
+  });
+
+  // ---- Reader: Paragraph comment modal (handled via module-level delegation in the highlights section) ----
+  // para-marker, para-form, para-close/overlay, para-like, para-comment-del, .hl*, .sel-* handlers
+  // are registered once on `document` so they keep working after individual paragraphs re-render.
+
+  // ---- Reader: Comment likes + reply toggle (end-list + comments page) ----
+  document.querySelectorAll('.ch-comment-like').forEach(el => {
+    el.addEventListener('click', () => {
+      toggleChapterCommentLike(el.dataset.book, el.dataset.chapter, el.dataset.comment);
+      render();
+    });
+  });
+  document.querySelectorAll('.ch-comment-reply-btn').forEach(el => {
+    el.addEventListener('click', () => {
+      const f = document.querySelector(`.ch-comment-reply-form[data-book="${el.dataset.book}"][data-chapter="${el.dataset.chapter}"][data-comment="${el.dataset.comment}"]`);
+      if (f) f.style.display = (f.style.display === 'none' || f.style.display === '') ? 'flex' : 'none';
+    });
+  });
+
+  // ---- Review likes ----
+  document.querySelectorAll('.review-like-btn').forEach(el => {
+    el.addEventListener('click', () => {
+      toggleReviewLike(el.dataset.book, el.dataset.review);
+      render();
+    });
+  });
+
+  // ---- Reader: Settings sheet + font size + scroll mode + pagination ----
+  const sheet = document.getElementById('reader-sheet');
+  const readerEl = document.getElementById('reader-content');
+  function sheetSet(open) {
+    if (!sheet) return;
+    sheet.classList.toggle('open', !!open);
+  }
+  document.querySelectorAll('.rd-menu-toggle').forEach(el => {
+    el.addEventListener('click', e => { e.preventDefault(); sheetSet(true); });
+  });
+  document.querySelectorAll('.rd-sheet-close, .reader-sheet-overlay').forEach(el => {
+    el.addEventListener('click', () => sheetSet(false));
+  });
+  if (readerEl) {
+    readerEl.addEventListener('click', e => {
+      if (e.target.closest('a, img, button, input, textarea, form, .para-marker, .hl, .sel-popup, .sel-form')) return;
+      const sel = window.getSelection && window.getSelection();
+      if (sel && sel.rangeCount && !sel.isCollapsed) return;
+      sheetSet(!(sheet && sheet.classList.contains('open')));
+    });
+    const onReaderSelect = () => {
+      const sel = window.getSelection && window.getSelection();
+      if (!sel || sel.isCollapsed || !sel.rangeCount) { hideSelPop(); return; }
+      const text = (sel.toString() || '').trim();
+      if (!text || text.length > 300) return;
+      const range = sel.getRangeAt(0);
+      const startP = closestParaEl(range.startContainer);
+      const endP = closestParaEl(range.endContainer);
+      if (!startP || !endP || startP !== endP) { hideSelPop(); return; }
+      const bookId = readerEl.dataset.book, chapterId = readerEl.dataset.chapter;
+      if (!bookId || !chapterId) return;
+      const para = +startP.dataset.para;
+      const start = domOffsetInto(startP, range.startContainer, range.startOffset);
+      const end = domOffsetInto(startP, range.endContainer, range.endOffset);
+      const plain = startP.textContent || '';
+      const s = Math.max(0, Math.min(start, plain.length));
+      const e2 = Math.max(s, Math.min(end, plain.length));
+      if (e2 <= s) { hideSelPop(); return; }
+      _sel = { bookId, chapterId, para, start: s, end: e2, text: plain.slice(s, e2) };
+      let rc = range.getBoundingClientRect();
+      if (!rc || (!rc.width && !rc.height)) {
+        const n = range.startContainer;
+        rc = (n && typeof n.getBoundingClientRect === 'function') ? n.getBoundingClientRect() : { left: 0, top: 0, width: 0, height: 0 };
+      }
+      showSelPop(rc);
+    };
+    readerEl.addEventListener('mouseup', onReaderSelect);
+    readerEl.addEventListener('keyup', onReaderSelect);
+    readerEl.addEventListener('scroll', hideSelPop, { passive: true });
+  }
+  function setFontSize(delta) {
+    const nv = Math.round((Math.max(0.8, Math.min(1.6, (state.readerFontSize || 1) + delta))) * 10) / 10;
+    state.readerFontSize = nv;
+    saveState();
+    if (readerEl) readerEl.style.fontSize = nv + 'rem';
+    const val = document.querySelector('.rd-font-val');
+    if (val) val.textContent = nv.toFixed(1);
+  }
+  document.querySelectorAll('.rd-font-plus').forEach(el => el.addEventListener('click', () => setFontSize(0.1)));
+  document.querySelectorAll('.rd-font-minus').forEach(el => el.addEventListener('click', () => setFontSize(-0.1)));
+  document.querySelectorAll('.rd-scroll-toggle').forEach(el => {
+    el.addEventListener('click', () => {
+      state.readerScrollMode = state.readerScrollMode === 'paged' ? 'continuous' : 'paged';
+      saveState();
+      render();
+    });
+  });
+  document.querySelectorAll('.rd-page-prev').forEach(el => {
+    el.addEventListener('click', () => {
+      state.readerPageIndex = Math.max(0, (state.readerPageIndex || 0) - 1);
+      saveState();
+      render();
+    });
+  });
+  document.querySelectorAll('.rd-page-next').forEach(el => {
+    el.addEventListener('click', () => {
+      state.readerPageIndex = (state.readerPageIndex || 0) + 1;
+      saveState();
+      render();
     });
   });
 }

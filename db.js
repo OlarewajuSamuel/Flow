@@ -209,4 +209,13 @@ if (!userColumns.includes('googleId')) db.exec('ALTER TABLE users ADD COLUMN goo
 if (!userColumns.includes('facebookId')) db.exec('ALTER TABLE users ADD COLUMN facebookId TEXT');
 if (!userColumns.includes('twitterId')) db.exec('ALTER TABLE users ADD COLUMN twitterId TEXT');
 
+const charColumns = columns('characters');
+if (!charColumns.includes('nickname')) db.exec("ALTER TABLE characters ADD COLUMN nickname TEXT DEFAULT ''");
+if (!charColumns.includes('age')) db.exec("ALTER TABLE characters ADD COLUMN age TEXT DEFAULT ''");
+if (!charColumns.includes('height')) db.exec("ALTER TABLE characters ADD COLUMN height TEXT DEFAULT ''");
+if (!charColumns.includes('weight')) db.exec("ALTER TABLE characters ADD COLUMN weight TEXT DEFAULT ''");
+
+const revColumns = columns('reviews');
+if (!revColumns.includes('ratings')) db.exec("ALTER TABLE reviews ADD COLUMN ratings TEXT DEFAULT '{}'");
+
 module.exports = db;
