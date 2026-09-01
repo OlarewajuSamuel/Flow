@@ -15,6 +15,7 @@ const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
 
 // ── Helpers ──────────────────────────────────────────
 const uid = () => crypto.randomUUID();
+const parseRatings = (s) => { try { const o = JSON.parse(s || '{}'); return o && typeof o === 'object' ? o : {}; } catch (e) { return {}; } };
 const today = () => new Date().toISOString().split('T')[0];
 const now = () => new Date().toISOString();
 
@@ -84,6 +85,9 @@ function withBookStats(book) {
   book.chapterCount = chapterCount;
   const viewData = db.prepare('SELECT SUM(count) as t FROM daily_views WHERE book_id = ?').get(book.id);
   book.views = viewData ? (viewData.t || 0) : 0;
+  const dvRows = db.prepare('SELECT date, count FROM daily_views WHERE book_id = ?').all(book.id);
+  book.dailyViews = {};
+  dvRows.forEach(r => { book.dailyViews[r.date] = r.count; });
   book.author = book.author || book.username || '';
   delete book.username;
   return book;
@@ -282,9 +286,10 @@ app.post('/api/books/:id/view', (req, res) => {
   const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id);
   if (!canReadBook(req, book)) return res.status(404).json({ error: 'Book not found' });
   const d = today();
+  const amount = Math.max(1, parseInt(req.body && req.body.amount, 10) || 1);
   const row = db.prepare('SELECT id, count FROM daily_views WHERE book_id = ? AND date = ?').get(req.params.id, d);
-  if (row) db.prepare('UPDATE daily_views SET count = count + 1 WHERE id = ?').run(row.id);
-  else db.prepare('INSERT INTO daily_views (id, book_id, date) VALUES (?,?,?)').run(uid(), req.params.id, d);
+  if (row) db.prepare('UPDATE daily_views SET count = count + ? WHERE id = ?').run(amount, row.id);
+  else db.prepare('INSERT INTO daily_views (id, book_id, date, count) VALUES (?,?,?,?)').run(uid(), req.params.id, d, amount);
   res.json({ ok: true });
 });
 
@@ -386,10 +391,10 @@ app.get('/api/books/:bookId/characters', (req, res) => {
 app.post('/api/books/:bookId/characters', requireUser, (req, res) => {
   const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.bookId);
   if (!book || book.author_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
-  const { name, biography, appearance, relationships, abilities, portrait, gallery } = req.body;
+  const { name, nickname, age, height, weight, biography, appearance, relationships, abilities, portrait, gallery } = req.body;
   const id = uid();
-  db.prepare('INSERT INTO characters (id, book_id, name, biography, appearance, relationships, abilities, portrait, gallery) VALUES (?,?,?,?,?,?,?,?,?)')
-    .run(id, req.params.bookId, name || '', biography || '', appearance || '', JSON.stringify(relationships || []), JSON.stringify(abilities || []), portrait || '', JSON.stringify(gallery || []));
+  db.prepare('INSERT INTO characters (id, book_id, name, nickname, age, height, weight, biography, appearance, relationships, abilities, portrait, gallery) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(id, req.params.bookId, name || '', nickname || '', age || '', height || '', weight || '', biography || '', appearance || '', JSON.stringify(relationships || []), JSON.stringify(abilities || []), portrait || '', JSON.stringify(gallery || []));
   const ch = db.prepare('SELECT * FROM characters WHERE id = ?').get(id);
   ch.relationships = JSON.parse(ch.relationships || '[]');
   ch.abilities = JSON.parse(ch.abilities || '[]');
@@ -402,9 +407,9 @@ app.put('/api/characters/:id', requireUser, (req, res) => {
   if (!ch) return res.status(404).json({ error: 'Not found' });
   const book = db.prepare('SELECT * FROM books WHERE id = ?').get(ch.book_id);
   if (!book || book.author_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
-  const { name, biography, appearance, relationships, abilities, portrait, gallery } = req.body;
-  db.prepare('UPDATE characters SET name=COALESCE(?,name), biography=COALESCE(?,biography), appearance=COALESCE(?,appearance), relationships=?, abilities=?, portrait=COALESCE(?,portrait), gallery=?, updated_at=? WHERE id=?')
-    .run(name, biography, appearance, JSON.stringify(relationships ?? JSON.parse(ch.relationships)), JSON.stringify(abilities ?? JSON.parse(ch.abilities)), portrait, JSON.stringify(gallery ?? JSON.parse(ch.gallery)), now(), req.params.id);
+  const { name, nickname, age, height, weight, biography, appearance, relationships, abilities, portrait, gallery } = req.body;
+  db.prepare('UPDATE characters SET name=COALESCE(?,name), nickname=COALESCE(?,nickname), age=COALESCE(?,age), height=COALESCE(?,height), weight=COALESCE(?,weight), biography=COALESCE(?,biography), appearance=COALESCE(?,appearance), relationships=?, abilities=?, portrait=COALESCE(?,portrait), gallery=?, updated_at=? WHERE id=?')
+    .run(name, nickname, age, height, weight, biography, appearance, JSON.stringify(relationships ?? JSON.parse(ch.relationships)), JSON.stringify(abilities ?? JSON.parse(ch.abilities)), portrait, JSON.stringify(gallery ?? JSON.parse(ch.gallery)), now(), req.params.id);
   const updated = db.prepare('SELECT * FROM characters WHERE id = ?').get(req.params.id);
   updated.relationships = JSON.parse(updated.relationships || '[]');
   updated.abilities = JSON.parse(updated.abilities || '[]');
@@ -426,19 +431,19 @@ app.get('/api/books/:bookId/reviews', (req, res) => {
   const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.bookId);
   if (!canReadBook(req, book)) return res.status(404).json({ error: 'Book not found' });
   const reviews = db.prepare('SELECT r.*, u.username FROM reviews r JOIN users u ON r.user_id = u.id WHERE r.book_id = ? ORDER BY r.pinned DESC, r.created_at DESC').all(req.params.bookId);
-  res.json(reviews);
+  res.json(reviews.map(rv => ({ ...rv, ratings: parseRatings(rv.ratings) })));
 });
 
 app.post('/api/books/:bookId/reviews', requireUser, (req, res) => {
-  const { rating, content } = req.body;
+  const { rating, content, ratings } = req.body;
   const book = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.bookId);
   if (!canReadBook(req, book)) return res.status(404).json({ error: 'Book not found' });
   const id = uid();
-  db.prepare('INSERT INTO reviews (id, book_id, user_id, rating, content) VALUES (?,?,?,?,?)')
-    .run(id, req.params.bookId, req.user.id, rating || 5, content || '');
+  db.prepare('INSERT INTO reviews (id, book_id, user_id, rating, content, ratings) VALUES (?,?,?,?,?,?)')
+    .run(id, req.params.bookId, req.user.id, rating || 5, content || '', JSON.stringify(ratings || {}));
   const rev = db.prepare('SELECT r.*, u.username FROM reviews r JOIN users u ON r.user_id = u.id WHERE r.id = ?').get(id);
   const reward = awardDailyExp(req.user.id, 'daily_review', 20);
-  res.json({ ...rev, expReward: reward });
+  res.json({ ...rev, ratings: parseRatings(rev.ratings), expReward: reward });
 });
 
 app.delete('/api/reviews/:id', requireUser, (req, res) => {
