@@ -1026,7 +1026,7 @@ function bindReaderSwipe() {
     if (!p) return;
     const track = document.getElementById('rp-track');
     if (!track || track.dataset.anim === '1') return;
-    if (e.target.closest && e.target.closest('a, button, .btn, mark, .sel-popup, .sel-form, .para-marker')) return;
+    if (e.target.closest && e.target.closest('a, button, .btn, mark, .sel-popup, .sel-form')) return;
     if (e.pointerType === 'touch' && e.touches && e.touches.length > 1) return;
     c = { p, track, id: e.pointerId, x: e.clientX, y: e.clientY, dx: 0, dy: 0, on: false };
   }, { passive: true });
@@ -1645,15 +1645,6 @@ function fillParaModal(bookId, chapterId, para) {
     : '<p style="font-size:0.65rem;color:var(--text3);text-align:center;padding:12px 0">No comments on this paragraph yet.</p>';
 }
 
-function refreshParaBadges(bookId, chapterId) {
-  document.querySelectorAll('.reader-para').forEach(p => {
-    const para = +p.dataset.para;
-    const n = getChapterComments(bookId, chapterId).filter(c => c.para === para).length;
-    const m = p.querySelector('.para-marker');
-    if (m) m.textContent = '+' + (n || '');
-  });
-}
-
 function submitParaForm(form) {
   const modal = document.getElementById('para-comment-modal');
   const ta = form.querySelector('[name="content"]');
@@ -1663,7 +1654,6 @@ function submitParaForm(form) {
   createChapterComment(b, ch, content, p);
   ta.value = '';
   fillParaModal(b, ch, p);
-  refreshParaBadges(b, ch);
 }
 
 // ---- Reader: passage-highlight modal ----
@@ -1734,8 +1724,6 @@ function submitHlForm(form) {
 if (!window._flowAnnotationBound) {
   window._flowAnnotationBound = true;
   document.addEventListener('click', e => {
-    const m = e.target.closest('.para-marker');
-    if (m) { e.preventDefault(); e.stopPropagation(); openParaModal(m.dataset.book, m.dataset.chapter, +m.dataset.para); return; }
     const h = e.target.closest('.hl');
     if (h) { e.preventDefault(); e.stopPropagation(); openHlModal(h.dataset.book, h.dataset.chapter, h.dataset.hl); return; }
     if (e.target.closest('.hl-close') || e.target.closest('.hl-overlay')) { closeHlModal(); return; }
@@ -1748,7 +1736,6 @@ if (!window._flowAnnotationBound) {
       if (!confirm('Delete this comment?')) return;
       deleteChapterComment(pdel.dataset.book, pdel.dataset.chapter, pdel.dataset.comment);
       fillParaModal(pdel.dataset.book, pdel.dataset.chapter, +pdel.dataset.para);
-      refreshParaBadges(pdel.dataset.book, pdel.dataset.chapter);
       return;
     }
     const hld = e.target.closest('.hl-del');
@@ -5318,7 +5305,7 @@ function bindPageEvents(route) {
   });
 
   // ---- Reader: Paragraph comment modal (handled via module-level delegation in the highlights section) ----
-  // para-marker, para-form, para-close/overlay, para-like, para-comment-del, .hl*, .sel-* handlers
+  // para-form, para-close/overlay, para-like, para-comment-del, .hl*, .sel-* handlers
   // are registered once on `document` so they keep working after individual paragraphs re-render.
 
   // ---- Reader: Comment likes + reply toggle (end-list + comments page) ----
@@ -5358,7 +5345,7 @@ function bindPageEvents(route) {
   });
   if (readerEl) {
     readerEl.addEventListener('click', e => {
-      if (e.target.closest('a, img, button, input, textarea, form, .para-marker, .hl, .sel-popup, .sel-form')) return;
+      if (e.target.closest('a, img, button, input, textarea, form, .hl, .sel-popup, .sel-form')) return;
       const sel = window.getSelection && window.getSelection();
       if (sel && sel.rangeCount && !sel.isCollapsed) return;
       sheetSet(!(sheet && sheet.classList.contains('open')));
