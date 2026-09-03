@@ -5,10 +5,14 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "build": "node -e \"console.log('Build complete (static SPA + Express serverless). No compile step needed.')\""
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "dependencies": {
-    "better-sqlite3": "^12.10.0",
+    "connect-pg-simple": "^10.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
@@ -16,6 +20,7 @@
     "passport": "^0.7.0",
     "passport-facebook": "^3.0.0",
     "passport-google-oauth20": "^2.0.0",
-    "passport-twitter": "^1.0.4"
+    "passport-twitter": "^1.0.4",
+    "pg": "^8.11.3"
   }
 }
