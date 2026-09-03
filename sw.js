@@ -1,4 +1,4 @@
-const CACHE = 'flow-world-v1';
+const CACHE = 'flow-world-v2';
 const ASSETS = [
   '/', '/index.html', '/app.js', '/styles.css',
   '/manifest.json',
@@ -18,12 +18,42 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
-  e.waitUntil(clients.claim());
+  e.waitUntil(
+    Promise.all(
+      caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+    ).then(() => self.clients.claim())
+  );
 });
 
 self.addEventListener('fetch', e => {
-  if (e.request.url.includes('/api/')) return;
+  const { request } = e;
+  if (request.method !== 'GET') return;
+  if (request.url.includes('/api/')) return;
+
+  const isShell = ['/index.html', '/app.js', '/styles.css', '/', '/manifest.json'].some(p => {
+    const u = new URL(request.url);
+    return u.pathname === p || u.pathname.toLowerCase().endsWith(p);
+  });
+
+  if (isShell) {
+    // Network-first for the app shell so fixes always reach the browser on the
+    // next online load, falling back to the cached copy when offline.
+    e.respondWith(
+      fetch(request).then(res => {
+        const copy = res.clone();
+        caches.open(CACHE).then(c => c.put(request, copy)).catch(() => {});
+        return res;
+      }).catch(() => caches.match(request).then(r => r || new Response('Offline', { status: 503 })))
+    );
+    return;
+  }
+
+  // Cache-first for static assets (icons, images).
   e.respondWith(
-    caches.match(e.request).then(r => r || fetch(e.request).catch(() => new Response('Offline', { status: 503 })))
+    caches.match(request).then(r => r || fetch(request).then(res => {
+      const copy = res.clone();
+      caches.open(CACHE).then(c => c.put(request, copy)).catch(() => {});
+      return res;
+    }).catch(() => new Response('Offline', { status: 503 })))
   );
 });
