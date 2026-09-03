@@ -828,7 +828,7 @@ function escHtml(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-const CONTENT_IMG_RE = /(^|\s)(https?:\/\/[^\s]+?\.(?:png|jpe?g|gif|webp|bmp|svg|avif|ico)(?:\?[^\s]*)?)/gi;
+const CONTENT_IMG_RE = /(^|\s)((?:https?:\/\/[^\s]+?\.(?:png|jpe?g|gif|webp|bmp|svg|avif|ico)(?:\?[^\s]*)?)|(?:data:image\/(?:png|jpe?g|gif|webp|bmp|svg\+xml|avif);base64,[A-Za-z0-9+/=\s]+))(?!\w)/gi;
 
 function renderRichContent(text) {
   if (!text) return '';
@@ -844,6 +844,8 @@ function renderRichContent(text) {
   html = html.replace(/\*\*(.+?)\*\*/gs, '<strong>$1</strong>');
   html = html.replace(/__(.+?)__/gs, '<strong>$1</strong>');
   html = html.replace(/\*([^*]+?)\*/gs, '<em>$1</em>');
+  // Underline (++text++)
+  html = html.replace(/\+\+(.+?)\+\+/gs, '<u>$1</u>');
 
   return html;
 }
@@ -870,12 +872,12 @@ function segmentBlock(block) {
     if (bEnd <= bStart) return;
     const span = bEnd - bStart;
     if (kind === 'img') { segs.push({ bStart, bEnd, kind, plen: 0, bpre: 0 }); return; }
-    const drop = kind === 'strong' ? 4 : 2;
-    segs.push({ bStart, bEnd, kind, plen: Math.max(0, span - drop), bpre: kind === 'strong' ? 2 : 1 });
+    const drop = (kind === 'strong' || kind === 'u') ? 4 : 2;
+    segs.push({ bStart, bEnd, kind, plen: Math.max(0, span - drop), bpre: (kind === 'strong' || kind === 'u') ? 2 : 1 });
   };
   const imgEndAt = (j) => {
     if (j > 0 && !/\s/.test(block[j - 1])) return null;
-    const m = block.slice(j).match(/^(https?:\/\/)([^\s]+?)\.(png|jpe?g|gif|webp|bmp|svg|avif|ico)(\?[^\s]*)?/i);
+    const m = block.slice(j).match(/^(?:(?:https?:\/\/)([^\s]+?)\.(?:png|jpe?g|gif|webp|bmp|svg|avif|ico)(?:\?[^\s]*)?|(?:data:image\/(?:png|jpe?g|gif|webp|bmp|svg\+xml|avif);base64,[A-Za-z0-9+/=\s]+))(?!\w)/i);
     return m ? j + m[0].length : null;
   };
   while (pos < n) {
@@ -883,6 +885,7 @@ function segmentBlock(block) {
     if (block.startsWith('**', pos)) { const e = block.indexOf('**', pos + 2); if (e > pos + 2) tok = { end: e + 2, kind: 'strong' }; }
     if (!tok && block.startsWith('__', pos)) { const e = block.indexOf('__', pos + 2); if (e > pos + 2) tok = { end: e + 2, kind: 'strong' }; }
     if (!tok && block[pos] === '*') { const e = block.indexOf('*', pos + 1); if (e > pos + 1) tok = { end: e + 1, kind: 'em' }; }
+    if (!tok && block.startsWith('++', pos)) { const e = block.indexOf('++', pos + 2); if (e > pos + 2) tok = { end: e + 2, kind: 'u' }; }
     if (!tok) { const ie = imgEndAt(pos); if (ie) tok = { end: ie, kind: 'img' }; }
     if (!tok) { pos++; continue; }
     if (pos > start) push(start, pos, 'text');
@@ -996,6 +999,14 @@ function readerTurnPage(dir, pagesEl, track) {
     state.readerPageIndex = next;
     saveState();
     render();
+    // Start the newly shown page from its top: scroll the reading area back to
+    // the top of the paragraphs (keep the fixed reader header controls visible).
+    requestAnimationFrame(() => {
+      const pagesEl2 = document.getElementById('reader-pages');
+      if (!pagesEl2) { window.scrollTo(0, 0); return; }
+      const y = pagesEl2.getBoundingClientRect().top + (window.pageYOffset || document.documentElement.scrollTop);
+      window.scrollTo(0, Math.max(0, y - 4));
+    });
   };
   track.addEventListener('transitionend', finish);
   window.setTimeout(finish, 520);
@@ -1869,7 +1880,9 @@ function render() {
   if (!root) return;
 
   let hideNav = false;
+  let isEditor = false;
   if (route.startsWith('/write/works/')) hideNav = true;
+  if (route.includes('/editor/')) isEditor = true;
 
   let mainContent = '';
   if (route === '/' || route === '') mainContent = renderFeatured();
@@ -1914,7 +1927,7 @@ function render() {
   root.innerHTML = `
     <div class="app-layout">
       ${hideNav ? '' : `<header class="top-header"><span class="app-logo">Flow World</span><div class="header-auth">${state.loggedIn ? `<span class="auth-user">${state.user.username}</span>${unreadTotal() ? `<span class="notif-badge" id="inbox-badge" style="cursor:pointer">${unreadTotal()}</span>` : ''}<button class="btn btn-sm auth-btn" id="sign-out-btn">Sign out</button>` : `<button class="btn btn-sm auth-btn" onclick="navigate('#/signin')">Sign in</button><button class="btn btn-primary auth-btn" onclick="navigate('#/signup')">Sign up</button>`}</div></header>`}
-      <main class="main-content">${mainContent}</main>
+      <main class="main-content${isEditor ? ' editor-main' : ''}">${mainContent}</main>
       ${hideNav ? '' : `
       <nav class="bottom-nav">
         <div class="nav-item${route==='/'||route.startsWith('/book')?' active':''}" data-nav="/"><img class="nav-icon" src="Icons/star.png" alt=""><span>Featured</span></div>
@@ -1929,7 +1942,7 @@ function render() {
   document.querySelectorAll('[data-nav]').forEach(el => {
     el.addEventListener('click', () => navigate('#' + el.dataset.nav));
   });
-  document.body.style.overflow = '';
+  document.body.style.overflow = isEditor ? 'hidden' : '';
 
   bindPageEvents(route);
   bindImageErrorLogging();
@@ -2418,33 +2431,145 @@ function renderWorkspaceBook(id) {
 }
 
 // ---- Create Chapter ----
+function editorToolbarHtml() {
+  return `<div class="editor-toolbar">
+      <button type="button" class="ed-fmt ed-fmt-bold" data-fmt="**" title="Bold"><strong>B</strong></button>
+      <button type="button" class="ed-fmt ed-fmt-italic" data-fmt="*" title="Italic"><em>I</em></button>
+      <button type="button" class="ed-fmt ed-fmt-underline" data-fmt="++" title="Underline"><u>U</u></button>
+      <button type="button" class="ed-fmt ed-fmt-img" data-img-insert title="Insert Image">&#128444;</button>
+      <span class="editor-toolbar-hint">Format: <strong>**bold**</strong>, <em>*italic*</em> or <u>++underline++</u></span>
+    </div>`;
+}
+
 function renderCreateChapter(bookId) {
   const book = getBook(bookId);
   if (!book) return '<div class="page"><h2>Book not found</h2></div>';
   return `
-    <div class="page">
-      <a class="back-link" href="#/write/works/${bookId}">Back to ${book.title}</a>
-      <h1 class="page-title">New Chapter</h1>
-      <form id="create-chapter-form" data-book="${bookId}" style="display:flex;flex-direction:column;gap:14px">
-        <div class="form-group">
-          <label>Chapter Title</label>
-          <input class="input-field" name="title" placeholder="Chapter title" required>
-        </div>
-        <div class="form-group">
-          <label>Content</label>
-          <div class="editor-toolbar">
-            <button type="button" class="ed-fmt ed-fmt-bold" data-fmt="**" title="Bold"><strong>B</strong></button>
-            <button type="button" class="ed-fmt ed-fmt-italic" data-fmt="*" title="Italic"><em>I</em></button>
-            <span class="editor-toolbar-hint">Format: <strong>**bold**</strong> or <em>*italic*</em></span>
-          </div>
-          <textarea class="input-field" name="content" placeholder="Write your chapter... (paste image links and they will display full-size)" rows="12" style="min-height:200px"></textarea>
-        </div>
-        <div style="display:flex;gap:8px">
-          <button type="submit" class="btn btn-primary" style="flex:1"><img src="Icons/settings.png" width="12" style="vertical-align:middle;margin-right:4px">Save Draft</button>
-          <button type="button" class="btn btn-sm ws-save-publish" data-book="${bookId}" style="flex:1;background:rgba(255,255,255,0.1);color:var(--accent)"><img src="Icons/editpen.png" width="12" style="vertical-align:middle;margin-right:4px">Save &amp; Publish</button>
-        </div>
-      </form>
+    <div class="editor-shell">
+      <div class="editor-topbar">
+        <a class="back-link" href="#/write/works/${bookId}" style="padding:0;font-size:0.85rem"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back</a>
+        <span style="flex:1;font-size:0.82rem;font-weight:600;min-width:80px">${book.title} - New Chapter</span>
+        <button type="submit" form="create-chapter-form" class="btn btn-primary ed-new-save" style="padding:5px 12px;font-size:0.65rem">Save Draft</button>
+        <button type="button" class="btn btn-sm ed-publish-new" data-book="${bookId}" style="font-size:0.65rem;background:rgba(255,255,255,0.1);color:var(--accent)">Save &amp; Publish</button>
+      </div>
+      <div class="editor-scroll">
+        <form id="create-chapter-form" data-book="${bookId}" class="editor-body" style="gap:14px">
+          <input class="input-field" name="title" placeholder="Chapter Title" style="font-size:1rem;font-weight:700;border:none;padding:4px 0;background:transparent" required>
+          ${editorToolbarHtml()}
+          <textarea class="input-field" name="content" id="editor-content" placeholder="Write your chapter... (paste image links or use the Insert Image button)"></textarea>
+        </form>
+      </div>
     </div>`;
+}
+
+// ---- Insert Image modal (editor toolbar) ----
+let _edImgCtx = null; // { editor }
+function openImgInsertModal(btn) {
+  if (document.getElementById('ed-img-modal')) return;
+  const toolbar = btn && btn.closest ? btn.closest('.editor-toolbar') : null;
+  const ta = toolbar ? toolbar.nextElementSibling : null;
+  const editorEl = (ta && ta.tagName === 'TEXTAREA') ? ta : document.getElementById('editor-content');
+  _edImgCtx = { editor: editorEl };
+  const overlay = document.createElement('div');
+  overlay.className = 'ed-img-overlay';
+  const panel = document.createElement('div');
+  panel.className = 'ed-img-panel';
+  panel.innerHTML = `
+    <h3>Insert Image</h3>
+    <div class="ed-img-tabs">
+      <button type="button" class="btn btn-sm active" data-edtab="link">Image URL</button>
+      <button type="button" class="btn btn-sm" data-edtab="file">Upload</button>
+    </div>
+    <div data-edtab-pane="link">
+      <input class="input-field" id="ed-img-url" placeholder="https://example.com/image.png" style="width:100%">
+      <img class="ed-img-preview" id="ed-img-url-preview" alt="">
+    </div>
+    <div data-edtab-pane="file" style="display:none">
+      <input type="file" id="ed-img-file" accept="image/*" style="width:100%">
+      <img class="ed-img-preview" id="ed-img-file-preview" alt="">
+    </div>
+    <p id="ed-img-msg" style="font-size:0.6rem;color:var(--text3);min-height:0;margin:0"></p>
+    <div class="ed-img-actions">
+      <button type="button" class="btn btn-sm ed-img-cancel">Cancel</button>
+      <button type="button" class="btn btn-primary ed-img-insert-btn">Insert</button>
+    </div>`;
+  const modal = document.createElement('div');
+  modal.id = 'ed-img-modal';
+  modal.className = 'ed-img-modal';
+  modal.appendChild(overlay);
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
+}
+
+function insertImgIntoEditor(editorEl, url, altText) {
+  if (!editorEl || !url) return;
+  const start = editorEl.selectionStart;
+  const end = editorEl.selectionEnd;
+  const val = editorEl.value || '';
+  const prefix = (start > 0 && !/\s$/.test(val[start - 1]) && !/^\s/.test(val.slice(start, start + 1))) ? '\n' : '';
+  const suffix = (end < val.length && !/^\s/.test(val[end]) && !/\s$/.test(val.slice(end - 1, end))) ? '\n' : '';
+  const ins = prefix + url + suffix;
+  editorEl.value = val.slice(0, start) + ins + val.slice(end);
+  editorEl.setSelectionRange(start + ins.length, start + ins.length);
+  editorEl.focus();
+  editorEl.dispatchEvent(new Event('input'));
+}
+
+function bindImgInsertModal() {
+  const modal = document.getElementById('ed-img-modal');
+  if (!modal) return;
+  let fileData = null;
+  const urlInput = modal.querySelector('#ed-img-url');
+  const urlPreview = modal.querySelector('#ed-img-url-preview');
+  const fileInput = modal.querySelector('#ed-img-file');
+  const filePreview = modal.querySelector('#ed-img-file-preview');
+  const msg = modal.querySelector('#ed-img-msg');
+  const dismiss = () => { modal.remove(); fileData = null; };
+  modal.querySelector('.ed-img-cancel').addEventListener('click', dismiss);
+  modal.querySelector('.ed-img-overlay').addEventListener('click', dismiss);
+  modal.querySelectorAll('.ed-img-tabs .btn').forEach(tab => {
+    tab.addEventListener('click', () => {
+      modal.querySelectorAll('.ed-img-tabs .btn').forEach(b => b.classList.toggle('active', b === tab));
+      const name = tab.dataset.edtab;
+      modal.querySelectorAll('[data-edtab-pane]').forEach(p => p.style.display = (p.dataset.edtabPane === name) ? '' : 'none');
+      msg.textContent = '';
+    });
+  });
+  urlInput.addEventListener('input', () => {
+    msg.textContent = '';
+    if (/^https?:\/\/.+/i.test(urlInput.value.trim())) {
+      urlPreview.src = urlInput.value.trim();
+      urlPreview.classList.add('show');
+    } else {
+      urlPreview.classList.remove('show');
+      urlPreview.removeAttribute('src');
+    }
+  });
+  fileInput.addEventListener('change', () => {
+    const f = fileInput.files[0];
+    msg.textContent = '';
+    if (!f) { fileData = null; filePreview.classList.remove('show'); return; }
+    if (!/^image\//.test(f.type)) { msg.textContent = 'Please choose an image file.'; return; }
+    const r = new FileReader();
+    r.onload = e => { fileData = e.target.result; filePreview.src = fileData; filePreview.classList.add('show'); };
+    r.readAsDataURL(f);
+  });
+  modal.querySelector('.ed-img-insert-btn').addEventListener('click', () => {
+    const tab = modal.querySelector('.ed-img-tabs .btn.active').dataset.edtab;
+    let url = '';
+    if (tab === 'file') {
+      if (!fileData) { msg.textContent = 'Choose an image file first.'; return; }
+      url = fileData;
+    } else {
+      url = urlInput.value.trim();
+      if (!/^https?:\/\/.+/i.test(url)) { msg.textContent = 'Enter a valid image URL.'; return; }
+    }
+    const editorEl = _edImgCtx && _edImgCtx.editor;
+    if (!editorEl) { msg.textContent = 'No editor target found.'; return; }
+    insertImgIntoEditor(editorEl, url);
+    dismiss();
+    _edImgCtx = null;
+  });
 }
 
 // ---- Characters: shared form + image cropper ----
@@ -2851,23 +2976,21 @@ function renderEditor(bookId, chapterId) {
   if (!book || !chapter) return '<div class="page"><h2>Not found</h2></div>';
 
   return `
-    <div style="display:flex;flex-direction:column;height:100vh;background:var(--bg)">
-      <div style="display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--bg-card);box-shadow:0 2px 8px rgba(0,0,0,0.2)">
+    <div class="editor-shell">
+      <div class="editor-topbar">
         <a class="back-link" href="#/write/works/${bookId}" style="padding:0;font-size:0.85rem"><img src="Icons/open-book.png" width="12" style="vertical-align:middle;margin-right:4px">Back</a>
-        <span style="flex:1;font-size:0.82rem;font-weight:600">${book.title} - Ch.${chapter.chapterNumber}</span>
+        <span style="flex:1;font-size:0.82rem;font-weight:600;min-width:80px">${book.title} - Ch.${chapter.chapterNumber}</span>
         <span id="editor-autosave-status" style="font-size:0.6rem;color:var(--text3);margin-right:6px"></span>
         <button class="btn btn-sm ed-save" data-book="${bookId}" data-ch="${chapterId}" style="font-size:0.65rem"><img src="Icons/settings.png" width="12" style="vertical-align:middle;margin-right:4px">Save</button>
         <button class="btn btn-sm ed-revisions" data-book="${bookId}" data-ch="${chapterId}" style="font-size:0.65rem"><img src="Icons/books-stack-of-three.png" width="12" style="vertical-align:middle;margin-right:4px">History</button>
         <button class="btn btn-primary ed-publish" data-book="${bookId}" data-ch="${chapterId}" style="padding:5px 12px;font-size:0.65rem">${chapter.published?'Unpublish':'Publish'}</button>
       </div>
-      <div style="flex:1;display:flex;flex-direction:column;padding:16px 20px;overflow-y:auto">
-        <input id="editor-title" class="input-field" style="font-size:1rem;font-weight:700;border:none;padding:4px 0;margin-bottom:12px;background:transparent" value="${chapter.title}" placeholder="Chapter Title">
-        <div class="editor-toolbar">
-          <button type="button" class="ed-fmt ed-fmt-bold" data-fmt="**" title="Bold"><strong>B</strong></button>
-          <button type="button" class="ed-fmt ed-fmt-italic" data-fmt="*" title="Italic"><em>I</em></button>
-          <span class="editor-toolbar-hint">Format: <strong>**bold**</strong> or <em>*italic*</em></span>
+      <div class="editor-scroll">
+        <div class="editor-body">
+          <input id="editor-title" class="input-field" style="font-size:1rem;font-weight:700;border:none;padding:4px 0;margin-bottom:12px;background:transparent" value="${chapter.title}" placeholder="Chapter Title">
+          ${editorToolbarHtml()}
+          <textarea id="editor-content" placeholder="Start writing...">${chapter.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</textarea>
         </div>
-        <textarea id="editor-content" style="flex:1;width:100%;background:transparent;border:none;resize:none;font-size:0.9rem;line-height:1.8;padding:4px 0;color:var(--text)" placeholder="Start writing...">${chapter.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</textarea>
       </div>
     </div>
 
@@ -4312,7 +4435,7 @@ function bindPageEvents(route) {
       createChapter(bookId, data);
       navigate('#/write/works/' + bookId);
     });
-    const pubBtn = chForm.querySelector('.ws-save-publish');
+    const pubBtn = chForm.closest('.editor-shell') ? chForm.closest('.editor-shell').querySelector('.ed-publish-new') : chForm.querySelector('.ws-save-publish');
     if (pubBtn) {
       pubBtn.addEventListener('click', () => {
         const fd = new FormData(chForm);
@@ -4490,10 +4613,11 @@ function bindPageEvents(route) {
     });
   }
 
-  // ---- Editor: Bold / Italic formatting ----
+  // ---- Editor: Bold / Italic / Underline formatting + Insert Image ----
   document.querySelectorAll('.ed-fmt').forEach(btn => {
     btn.addEventListener('mousedown', e => e.preventDefault());
     btn.addEventListener('click', () => {
+      if (btn.dataset.imgInsert) { openImgInsertModal(btn); return; }
       const toolbar = btn.closest('.editor-toolbar');
       const ta = toolbar ? toolbar.nextElementSibling : null;
       const editorContentEl = (ta && ta.tagName === 'TEXTAREA') ? ta : document.getElementById('editor-content');
@@ -4516,6 +4640,7 @@ function bindPageEvents(route) {
       editorContentEl.dispatchEvent(new Event('input'));
     });
   });
+  bindImgInsertModal();
 
   // ---- Editor revisions ----
   document.querySelectorAll('.ed-revisions').forEach(el => {
