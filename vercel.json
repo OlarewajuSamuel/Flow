@@ -1,16 +1,19 @@
 {
   "version": 2,
   "builds": [
-    {
-      "src": "server.js",
-      "use": "@vercel/node"
-    }
+    { "src": "server.js", "use": "@vercel/node" },
+    { "src": "index.html", "use": "@vercel/static" },
+    { "src": "app.js", "use": "@vercel/static" },
+    { "src": "sw.js", "use": "@vercel/static" },
+    { "src": "styles.css", "use": "@vercel/static" },
+    { "src": "manifest.json", "use": "@vercel/static" },
+    { "src": "Icons/**", "use": "@vercel/static" }
   ],
   "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "/server.js",
-      "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
-    }
+    { "src": "/api/(.*)", "dest": "/server.js", "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"] },
+    { "src": "/Icons/(.*)", "dest": "/Icons/$1" },
+    { "src": "/(app\\.js|styles\\.css|manifest\\.json|sw\\.js|favicon\\.ico|robots\\.txt)", "dest": "/$1" },
+    { "src": "/", "dest": "/index.html" },
+    { "src": "/(.*)", "dest": "/server.js", "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"] }
   ]
 }

@@ -1874,6 +1874,19 @@ function getRoute() {
 // ============================================================
 // RENDER
 // ============================================================
+function renderErrorPanel(route, err) {
+  const msg = (err && err.message) ? err.message : String(err);
+  return `
+    <div class="page">
+      <div style="padding:24px;text-align:center;color:var(--text, inherit);">
+        <h3 style="margin:0 0 8px;">Something went wrong</h3>
+        <p style="opacity:0.8;margin:0 0 8px;word-break:break-word;">We couldn't render this page${route ? ' (' + route + ')' : ''}.</p>
+        <p style="opacity:0.55;font-size:12px;word-break:break-word;">${escHtml(msg)}</p>
+        <button class="btn btn-primary" onclick="navigate('#/')">Back to Featured</button>
+      </div>
+    </div>`;
+}
+
 function render() {
   const route = getRoute();
   const root = document.getElementById('root');
@@ -1885,44 +1898,49 @@ function render() {
   if (route.includes('/editor/')) isEditor = true;
 
   let mainContent = '';
-  if (route === '/' || route === '') mainContent = renderFeatured();
-  else if (route === '/library') mainContent = renderLibrary();
-  else if (route === '/write') mainContent = renderWriteWorks();
-  else if (route === '/write/create') mainContent = renderCreateBook();
-  else if (route.startsWith('/write/works/')) {
-    const parts = route.split('/');
-    const id = parts[3];
-    if (parts[4] === 'editor') mainContent = renderEditor(id, parts[5]);
-    else if (parts[4] === 'chapters' && parts[5] === 'new') mainContent = renderCreateChapter(id);
-    else if (parts[4] === 'characters' && parts[5] === 'new') mainContent = renderCreateCharacter(id);
-    else if (parts[4] === 'characters' && parts[5]) mainContent = renderEditCharacter(id, parts[5]);
-    else if (parts[4] === 'highlights') mainContent = renderHighlightsPage(id);
-    else mainContent = renderWorkspaceBook(id);
-  } else if (route === '/explore' || route === '/explore/novel') mainContent = renderExplore('Novel');
-  else if (route === '/explore/fanfic') mainContent = renderExplore('Fanfic');
-  else if (route === '/signin') mainContent = renderSignIn();
-  else if (route === '/signup') mainContent = renderSignUp();
-  else if (route === '/auth/google') { window.location.href = '/api/auth/google'; return; }
-  else if (route === '/auth/facebook') { window.location.href = '/api/auth/facebook'; return; }
-  else if (route === '/auth/twitter') { window.location.href = '/api/auth/twitter'; return; }
-  else if (route === '/profile') mainContent = renderProfile();
-  else if (route === '/profile/edit') mainContent = renderEditProfile();
-  else if (route === '/profile/author') mainContent = renderAuthorProfile();
-  else if (route === '/profile/themes') mainContent = renderThemes();
-  else if (route === '/inbox') mainContent = renderInbox();
-  else if (route.startsWith('/book/') && route.includes('/read/')) {
-    const parts = route.split('/');
-    mainContent = renderChapterReader(parts[2], parts[4]);
-  } else if (route.startsWith('/book/') && route.split('/').length >= 5 && route.split('/')[3] === 'character') {
-    const parts = route.split('/');
-    mainContent = renderCharacterPage(parts[2], parts[4]);
-  } else if (route.startsWith('/book/') && route.split('/')[3] === 'comments' && route.split('/').length >= 5) {
-    const parts = route.split('/');
-    mainContent = renderChapterComments(parts[2], parts[4]);
-  } else if (route.startsWith('/book/')) {
-    const id = route.split('/')[2];
-    mainContent = renderBookPage(id);
-  } else mainContent = renderFeatured();
+  try {
+    if (route === '/' || route === '') mainContent = renderFeatured();
+    else if (route === '/library') mainContent = renderLibrary();
+    else if (route === '/write') mainContent = renderWriteWorks();
+    else if (route === '/write/create') mainContent = renderCreateBook();
+    else if (route.startsWith('/write/works/')) {
+      const parts = route.split('/');
+      const id = parts[3];
+      if (parts[4] === 'editor') mainContent = renderEditor(id, parts[5]);
+      else if (parts[4] === 'chapters' && parts[5] === 'new') mainContent = renderCreateChapter(id);
+      else if (parts[4] === 'characters' && parts[5] === 'new') mainContent = renderCreateCharacter(id);
+      else if (parts[4] === 'characters' && parts[5]) mainContent = renderEditCharacter(id, parts[5]);
+      else if (parts[4] === 'highlights') mainContent = renderHighlightsPage(id);
+      else mainContent = renderWorkspaceBook(id);
+    } else if (route === '/explore' || route === '/explore/novel') mainContent = renderExplore('Novel');
+    else if (route === '/explore/fanfic') mainContent = renderExplore('Fanfic');
+    else if (route === '/signin') mainContent = renderSignIn();
+    else if (route === '/signup') mainContent = renderSignUp();
+    else if (route === '/auth/google') { window.location.href = '/api/auth/google'; return; }
+    else if (route === '/auth/facebook') { window.location.href = '/api/auth/facebook'; return; }
+    else if (route === '/auth/twitter') { window.location.href = '/api/auth/twitter'; return; }
+    else if (route === '/profile') mainContent = renderProfile();
+    else if (route === '/profile/edit') mainContent = renderEditProfile();
+    else if (route === '/profile/author') mainContent = renderAuthorProfile();
+    else if (route === '/profile/themes') mainContent = renderThemes();
+    else if (route === '/inbox') mainContent = renderInbox();
+    else if (route.startsWith('/book/') && route.includes('/read/')) {
+      const parts = route.split('/');
+      mainContent = renderChapterReader(parts[2], parts[4]);
+    } else if (route.startsWith('/book/') && route.split('/').length >= 5 && route.split('/')[3] === 'character') {
+      const parts = route.split('/');
+      mainContent = renderCharacterPage(parts[2], parts[4]);
+    } else if (route.startsWith('/book/') && route.split('/')[3] === 'comments' && route.split('/').length >= 5) {
+      const parts = route.split('/');
+      mainContent = renderChapterComments(parts[2], parts[4]);
+    } else if (route.startsWith('/book/')) {
+      const id = route.split('/')[2];
+      mainContent = renderBookPage(id);
+    } else mainContent = renderFeatured();
+  } catch (err) {
+    console.error('[Flow] Rendering error on route "' + route + '":', err);
+    mainContent = renderErrorPanel(route, err);
+  }
 
   root.innerHTML = `
     <div class="app-layout">
@@ -5541,9 +5559,47 @@ function bindPageEvents(route) {
 // ============================================================
 // INIT
 // ============================================================
+function showFatalError(msg) {
+  const root = document.getElementById('root');
+  if (!root) return;
+  const details = document.createElement('span');
+  details.textContent = msg || '';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn';
+  btn.textContent = 'Retry';
+  btn.style.marginTop = '12px';
+  btn.onclick = () => location.reload();
+  root.innerHTML = '';
+  const box = document.createElement('div');
+  box.style.cssText = 'padding:32px;text-align:center;font-family:sans-serif;color:inherit;';
+  const h = document.createElement('h2');
+  h.textContent = 'Flow World could not load';
+  h.style.margin = '0 0 8px';
+  const p = document.createElement('p');
+  p.textContent = 'Something went wrong starting the app.';
+  p.style.opacity = '0.8';
+  box.appendChild(h);
+  box.appendChild(p);
+  if (msg) { details.style.cssText = 'display:block;opacity:0.55;font-size:12px;margin:8px auto;max-width:640px;word-break:break-word;'; box.appendChild(details); }
+  box.appendChild(btn);
+  root.appendChild(box);
+}
+window.addEventListener('error', (e) => {
+  console.error('[Flow] Uncaught error:', e.error || e.message);
+  try { if (typeof window.render === 'function') showFatalError((e.error && (e.error.stack || e.error.message)) || e.message); } catch (_) {}
+});
+window.addEventListener('unhandledrejection', (e) => {
+  console.error('[Flow] Unhandled promise rejection:', e.reason);
+});
 window.addEventListener('hashchange', render);
 window.addEventListener('popstate', render);
 (async function init() {
-  await initAuth();
-  render();
+  try {
+    await initAuth();
+    render();
+  } catch (err) {
+    console.error('[Flow] Init failed:', err);
+    showFatalError((err && (err.stack || err.message)) || String(err));
+  }
 })();

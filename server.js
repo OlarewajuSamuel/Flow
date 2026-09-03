@@ -792,9 +792,10 @@ app.get('/api/follow/check/:userId', requireUser, async (req, res) => {
 });
 
 // ── Static files + SPA fallback ──────────────────────
-// Vercel serves the static assets (Icons/, app.js, styles.css, index.html)
-// from the project root *before* hitting this function. This handler also
-// supports running fully locally, where Express serves them directly.
+// On Vercel, vercel.json routes real files (/, app.js, styles.css, manifest.json,
+// Icons/*, sw.js) to Vercel's static file system with correct MIME types, and only
+// /api/* and SPA deep-links reach this function. This express.static handler is for
+// local development / traditional hosting where Express serves assets directly.
 app.use(express.static(__dirname));
 
 app.get('*', (req, res) => {
